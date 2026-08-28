@@ -1,0 +1,24 @@
+services:
+  quant-execution:
+    image: quant-execution:dev
+    environment:
+      DATABASE_URL: postgresql+psycopg://app:app@db.internal:5432/app
+      API_LISTEN_ADDRESS: 0.0.0.0
+      API_PORT: "8000"
+      EXEC_LOG_LEVEL: INFO
+      EXEC_KAFKA_BOOTSTRAP_SERVERS: kafka.internal:9092
+      EXEC_KAFKA_TOPIC_PAPER: ticks.paper
+      EXEC_KAFKA_TOPIC_LIVE: ticks.live
+      EXEC_KAFKA_GROUP_PREFIX: quant-execution
+      EXEC_WATCHLIST_API_URL: http://quant-stickynote.internal:8000
+      EXEC_WATCHLIST_REFRESH_SECONDS: "60"
+      EXEC_CASH_API_URL: http://quant-cash.internal:8000
+      EXEC_CASH_ACCOUNT_ID: ""
+      EXEC_ALPACA_BASE_URL: https://paper-api.alpaca.markets
+      EXEC_ALPACA_API_KEY: ""
+      EXEC_ALPACA_API_SECRET: ""
+      EXEC_ORDER_NOTIONAL_USD: "1000"
+      EXEC_PRICE_MATCH_TOLERANCE: "0"
+      EXEC_ALPACA_POLL_SECONDS: "5"
+    ports:
+      - "8000:8000"
