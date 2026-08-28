@@ -18,6 +18,7 @@ def _entry(symbol: str, price: str, position: PositionType, reason: str = "r") -
     return WatchlistEntry(
         symbol=symbol,
         buy_price=Decimal(price),
+        sell_price=Decimal(price) * 2,
         position_type=position,
         trigger_reason=reason,
     )

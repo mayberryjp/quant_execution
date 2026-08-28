@@ -1,9 +1,11 @@
-"""Executor worker entrypoint (SPEC.md §5.1).
+"""Executor worker entrypoint (SPEC.md §5.1 / §5.7).
 
-Selects its mode (``paper``/``live``) from the ``--mode`` CLI argument. Both modes run
-concurrently as separate supervisord programs sharing the same code path. It consumes ticks,
-matches them against the in-memory watchlist, and hands each match to the
-:class:`ExecutionService` (which persists the trade and, for paper, records the assumed fill).
+Selects its mode (``paper``/``live``) from the ``--mode`` CLI argument. Both modes run concurrently
+as separate supervisord programs sharing the same code path. It consumes ticks, matches them against
+the in-memory watchlist to open positions, and checks each tick against the in-memory position book
+to exit positions whose sell price is reached. Durable state is written by a non-blocking background
+writer; live fills are confirmed by a reconciler; and a per-mode liquidator flattens every open
+position at the configured market-close time.
 """
 
 from __future__ import annotations
@@ -14,17 +16,29 @@ import signal
 import threading
 from decimal import Decimal
 from types import FrameType
+from zoneinfo import ZoneInfo
 
 from quant_execution.clients.alpaca_client import AlpacaBroker
 from quant_execution.clients.cash_client import CashClient
 from quant_execution.clients.watchlist_client import WatchlistClient
 from quant_execution.config import settings
+from quant_execution.db import session_scope
 from quant_execution.domain.enums import ExecutionMode
 from quant_execution.domain.matching import WatchlistRefresher, WatchlistStore
+from quant_execution.domain.positions import PositionBook
 from quant_execution.domain.schemas import Tick
-from quant_execution.domain.services import ExecutionService, ReconciliationService
+from quant_execution.domain.services import (
+    REHYDRATE_STATUSES,
+    ExecutionService,
+    MarketCloseLiquidator,
+    PositionReconciler,
+    parse_close_time,
+    position_from_trade,
+)
 from quant_execution.kafka.consumer import MessageMeta, TickConsumer, create_consumer
 from quant_execution.logging import configure_logging, get_logger
+from quant_execution.repository.async_writer import AsyncDbWriter
+from quant_execution.repository.trades_repo import TradesRepository
 
 VALID_MODES = tuple(m.value for m in ExecutionMode)
 
@@ -41,12 +55,30 @@ def process_message(
     store: WatchlistStore,
     service: ExecutionService,
 ) -> None:
-    """Parse a tick, match it, and execute each match. Raises on malformed input (poison)."""
+    """Per-tick hot path: record price, open on match, exit on target. Raises on poison input."""
     if value is None:
         raise ValueError("empty message value")
     tick = Tick.parse(value)
+    service.record_price(tick.symbol, tick.price)
     for entry in store.match(tick.symbol, tick.price):
         service.execute(tick, entry, provenance=meta)
+    service.check_exits(tick)
+
+
+def rehydrate_positions(mode: ExecutionMode, service: ExecutionService, log: logging.Logger) -> None:
+    """Rebuild the in-memory position book and dedup set from open trades (SPEC.md §5.7)."""
+    try:
+        with session_scope() as session:
+            repo = TradesRepository(session)
+            trades = repo.list_by_statuses(REHYDRATE_STATUSES, is_paper=mode.is_paper)
+        keys = []
+        for trade in trades:
+            service.book.open(position_from_trade(trade))
+            keys.append(trade.idempotency_key)
+        service.seed(keys)
+        log.info("rehydrated positions=%d", len(trades))
+    except Exception:
+        log.exception("position rehydration failed; starting with an empty book")
 
 
 def _install_signal_handlers(stop_event: threading.Event, log: logging.Logger) -> None:
@@ -77,31 +109,46 @@ def main() -> None:
     cash: CashClient | None = None
     if not mode.is_paper:
         cash = CashClient(settings.cash_api_url, settings.cash_account_id)
+
+    book = PositionBook()
+    writer = AsyncDbWriter(
+        batch_size=settings.db_writer_batch_size, queue_size=settings.db_writer_queue_size
+    )
     service = ExecutionService(
         mode,
         broker,
+        writer,
+        book,
         notional_usd=settings.order_notional_usd,
         quantity=settings.order_quantity,
         cash=cash,
     )
+    rehydrate_positions(mode, service, log)
 
     stop_event = threading.Event()
     _install_signal_handlers(stop_event, log)
 
-    refresher_thread = threading.Thread(
-        target=refresher.run_forever, args=(stop_event,), daemon=True
-    )
-    refresher_thread.start()
+    threading.Thread(target=writer.run_forever, args=(stop_event,), daemon=True).start()
+    threading.Thread(target=refresher.run_forever, args=(stop_event,), daemon=True).start()
 
     if not mode.is_paper and cash is not None:
-        reconciler = ReconciliationService(broker, cash)
-        reconciler_thread = threading.Thread(
+        reconciler = PositionReconciler(broker, cash, writer, book)
+        threading.Thread(
             target=reconciler.run_forever,
             args=(stop_event, float(settings.alpaca_poll_seconds)),
             daemon=True,
-        )
-        reconciler_thread.start()
+        ).start()
         log.info("reconciliation loop started interval=%ss", settings.alpaca_poll_seconds)
+
+    close_raw = settings.market_close_paper if mode.is_paper else settings.market_close_live
+    liquidator = MarketCloseLiquidator(
+        service,
+        parse_close_time(close_raw),
+        ZoneInfo(settings.market_timezone),
+        check_seconds=float(settings.market_close_check_seconds),
+    )
+    threading.Thread(target=liquidator.run_forever, args=(stop_event,), daemon=True).start()
+    log.info("market close liquidator armed close=%s tz=%s", close_raw, settings.market_timezone)
 
     topic = settings.kafka_topic_paper if mode.is_paper else settings.kafka_topic_live
     group_id = f"{settings.kafka_group_prefix}.{mode}"
@@ -119,4 +166,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

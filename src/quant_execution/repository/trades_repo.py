@@ -7,9 +7,10 @@ interpolation is never used (SPEC.md §3.1, backend standards).
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from quant_execution.repository.models import Trade
@@ -73,10 +74,29 @@ class TradesRepository:
         self._session.flush()
         return trade
 
+    def apply_update(self, trade_id: uuid.UUID, /, **fields: object) -> None:
+        """Blind UPDATE by primary key (used by the async writer; no row load required)."""
+        if not fields:
+            return
+        stmt = update(Trade).where(Trade.id == trade_id).values(**fields)
+        self._session.execute(stmt)
+
     def list_by_status(self, status: str, *, limit: int = 100) -> list[Trade]:
         stmt = (
             select(Trade)
             .where(Trade.status == status)
+            .order_by(Trade.created_at)
+            .limit(limit)
+        )
+        return list(self._session.execute(stmt).scalars().all())
+
+    def list_by_statuses(
+        self, statuses: Sequence[str], *, is_paper: bool, limit: int = 10_000
+    ) -> list[Trade]:
+        """Load trades in any of ``statuses`` for one mode (startup rehydration)."""
+        stmt = (
+            select(Trade)
+            .where(Trade.status.in_(statuses), Trade.is_paper == is_paper)
             .order_by(Trade.created_at)
             .limit(limit)
         )

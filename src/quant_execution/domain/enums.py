@@ -32,6 +32,16 @@ class PositionType(StrEnum):
         """Entry order side derived from the position type (SPEC.md §3.2)."""
         return OrderSide.BUY if self is PositionType.LONG else OrderSide.SELL
 
+    @property
+    def exit_side(self) -> OrderSide:
+        """Exit order side (opposite of entry): SELL to close a LONG, BUY to cover a SHORT."""
+        return OrderSide.SELL if self is PositionType.LONG else OrderSide.BUY
+
+
+class ExitReason(StrEnum):
+    TARGET_PRICE = "TARGET_PRICE"
+    MARKET_CLOSE = "MARKET_CLOSE"
+
 
 class TradeStatus(StrEnum):
     NEW = "NEW"
@@ -42,3 +52,8 @@ class TradeStatus(StrEnum):
     REJECTED = "REJECTED"
     INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"
     FAILED = "FAILED"
+    # Exit lifecycle (the entry row is updated in place; SPEC.md §5.7).
+    EXIT_SUBMITTED = "EXIT_SUBMITTED"
+    EXIT_PARTIALLY_FILLED = "EXIT_PARTIALLY_FILLED"
+    CLOSED = "CLOSED"
+    EXIT_FAILED = "EXIT_FAILED"

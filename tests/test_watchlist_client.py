@@ -25,10 +25,10 @@ def _client(handler: Handler, *, page_size: int = 2) -> WatchlistClient:
 def test_fetch_active_follows_pagination() -> None:
     pages = {
         0: [
-            {"symbol": "AAPL", "buy_price": "100", "position_type": "LONG"},
-            {"symbol": "MSFT", "buy_price": "50", "position_type": "SHORT"},
+            {"symbol": "AAPL", "buy_price": "100", "sell_price": "110", "position_type": "LONG"},
+            {"symbol": "MSFT", "buy_price": "50", "sell_price": "45", "position_type": "SHORT"},
         ],
-        2: [{"symbol": "TSLA", "buy_price": "200", "position_type": "LONG"}],
+        2: [{"symbol": "TSLA", "buy_price": "200", "sell_price": "220", "position_type": "LONG"}],
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -46,7 +46,7 @@ def test_fetch_active_accepts_items_envelope() -> None:
         if offset == 0:
             return httpx.Response(
                 200,
-                json={"items": [{"symbol": "AAPL", "buy_price": "10", "position_type": "LONG"}]},
+                json={"items": [{"symbol": "AAPL", "buy_price": "10", "sell_price": "12", "position_type": "LONG"}]},
             )
         return httpx.Response(200, json={"items": []})
 

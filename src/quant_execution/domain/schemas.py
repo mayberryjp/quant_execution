@@ -17,6 +17,7 @@ class WatchlistEntry(BaseModel):
 
     symbol: str
     buy_price: Decimal
+    sell_price: Decimal
     position_type: PositionType
     source_query_id: str | None = None
     trigger_reason: str | None = None
@@ -83,6 +84,11 @@ class TradeResponse(BaseModel):
     broker_order_id: str | None
     filled_quantity: Decimal | None
     filled_avg_price: Decimal | None
+    target_sell_price: Decimal | None
+    exit_broker_order_id: str | None
+    exit_filled_quantity: Decimal | None
+    exit_filled_avg_price: Decimal | None
+    exit_reason: str | None
     cash_hold_id: uuid.UUID | None
     source_query_id: str | None
     trigger_reason: str | None
@@ -92,6 +98,8 @@ class TradeResponse(BaseModel):
     created_at: datetime
     submitted_at: datetime | None
     filled_at: datetime | None
+    exit_submitted_at: datetime | None
+    closed_at: datetime | None
     updated_at: datetime
 
     @classmethod

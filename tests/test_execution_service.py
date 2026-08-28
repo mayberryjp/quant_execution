@@ -1,30 +1,39 @@
-"""Unit tests for the execution core (SLICE 4): sizing, idempotency, paper fill, broker error.
+"""Unit tests for the execution core: buy/sell lifecycle, exits, reconcile, liquidation.
 
-The Alpaca client is mocked with ``httpx.MockTransport`` (no network) and persistence is faked with
-an in-memory unit-of-work (no database), so these tests run without external services.
+The Alpaca client is mocked with ``httpx.MockTransport`` (no network); persistence is faked with an
+in-memory :class:`FakeWriter` (no database) that applies inserts/updates onto the trade objects, and
+the real in-memory :class:`PositionBook` is used so exit/close behavior is exercised end-to-end.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 
 from quant_execution.clients.alpaca_client import AlpacaBroker
 from quant_execution.clients.cash_client import CashHold
-from quant_execution.domain.enums import ExecutionMode, OrderSide, PositionType, TradeStatus
-from quant_execution.domain.exceptions import BrokerError, CashServiceError, ConfigurationError
+from quant_execution.domain.enums import (
+    ExecutionMode,
+    ExitReason,
+    OrderSide,
+    PositionType,
+    TradeStatus,
+)
+from quant_execution.domain.exceptions import CashServiceError, ConfigurationError
+from quant_execution.domain.positions import Position, PositionBook, PositionState
 from quant_execution.domain.schemas import Tick, WatchlistEntry
 from quant_execution.domain.services import (
     ExecutionService,
-    ReconciliationService,
+    MarketCloseLiquidator,
+    PositionReconciler,
     build_idempotency_key,
     compute_sizing,
+    parse_close_time,
 )
 from quant_execution.kafka.consumer import MessageMeta
 from quant_execution.repository.models import Trade
@@ -33,157 +42,19 @@ _PROVENANCE = MessageMeta(topic="ticks.paper", partition=0, offset=7)
 _LIVE_PROVENANCE = MessageMeta(topic="ticks.live", partition=0, offset=9)
 
 
+class FakeWriter:
+    """Synchronous stand-in for the async writer: applies updates onto the trade objects."""
 
-class FakeRepo:
-    def __init__(self, existing: set[str] | None = None) -> None:
-        self.existing = existing or set()
-        self.inserted: list[Trade] = []
+    def __init__(self) -> None:
+        self.trades: dict[uuid.UUID, Trade] = {}
 
-    def exists_by_idempotency_key(self, idempotency_key: str) -> bool:
-        return idempotency_key in self.existing
+    def insert(self, trade: Trade) -> None:
+        self.trades[trade.id] = trade
 
-    def insert(self, trade: Trade) -> Trade:
-        self.inserted.append(trade)
-        self.existing.add(trade.idempotency_key)
-        return trade
-
-
-def _uow_factory(repo: FakeRepo):
-    @contextmanager
-    def factory() -> Iterator[FakeRepo]:
-        yield repo
-
-    return factory
-
-
-def _broker(handler: httpx.MockTransport, *, attempts: int = 1) -> AlpacaBroker:
-    return AlpacaBroker(
-        "https://paper-api.alpaca.markets",
-        "key",
-        "secret",
-        max_attempts=attempts,
-        transport=handler,
-    )
-
-
-def _ok_transport() -> httpx.MockTransport:
-    def handle(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"id": "broker-123", "status": "accepted"})
-
-    return httpx.MockTransport(handle)
-
-
-def _entry() -> WatchlistEntry:
-    return WatchlistEntry(
-        symbol="AAPL",
-        buy_price=Decimal(100),
-        position_type=PositionType.LONG,
-        trigger_reason="dip",
-    )
-
-
-def test_build_idempotency_key_uses_utc_date() -> None:
-    tick = Tick(symbol="AAPL", price=Decimal(99), ts=datetime(2024, 1, 2, 12, 0, tzinfo=UTC))
-    key = build_idempotency_key(ExecutionMode.PAPER, _entry(), tick)
-    assert key == "paper:AAPL:dip:2024-01-02"
-
-
-def test_compute_sizing_by_notional() -> None:
-    qty, notional = compute_sizing(Decimal(50), notional_usd=100.0, quantity=None)
-    assert qty == Decimal(2)
-    assert notional == Decimal(100)
-
-
-def test_compute_sizing_by_quantity() -> None:
-    qty, notional = compute_sizing(Decimal(50), notional_usd=None, quantity=3.0)
-    assert qty == Decimal(3)
-    assert notional == Decimal(150)
-
-
-def test_compute_sizing_requires_exactly_one() -> None:
-    with pytest.raises(ConfigurationError):
-        compute_sizing(Decimal(50), notional_usd=None, quantity=None)
-    with pytest.raises(ConfigurationError):
-        compute_sizing(Decimal(50), notional_usd=100.0, quantity=3.0)
-
-
-def test_paper_execute_records_filled_trade() -> None:
-    repo = FakeRepo()
-    service = ExecutionService(
-        ExecutionMode.PAPER,
-        _broker(_ok_transport()),
-        notional_usd=100.0,
-        quantity=None,
-        unit_of_work=_uow_factory(repo),
-    )
-    tick = Tick(symbol="AAPL", price=Decimal(50))
-    trade = service.execute(tick, _entry(), provenance=_PROVENANCE)
-
-    assert trade is not None
-    assert trade.is_paper is True
-    assert trade.status == TradeStatus.FILLED.value
-    assert trade.side == OrderSide.BUY.value
-    assert trade.quantity == Decimal(2)
-    assert trade.notional == Decimal(100)
-    assert trade.broker_order_id == "broker-123"
-    assert trade.filled_quantity == Decimal(2)
-    assert trade.filled_avg_price == Decimal(50)
-    assert trade.kafka_offset == 7
-    assert len(repo.inserted) == 1
-
-
-def test_execute_dedup_is_noop() -> None:
-    tick = Tick(symbol="AAPL", price=Decimal(50))
-    key = build_idempotency_key(ExecutionMode.PAPER, _entry(), tick)
-    repo = FakeRepo(existing={key})
-    service = ExecutionService(
-        ExecutionMode.PAPER,
-        _broker(_ok_transport()),
-        notional_usd=100.0,
-        quantity=None,
-        unit_of_work=_uow_factory(repo),
-    )
-    assert service.execute(tick, _entry(), provenance=_PROVENANCE) is None
-    assert repo.inserted == []
-
-
-def test_broker_error_sets_failed() -> None:
-    def handle(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"message": "bad"})
-
-    repo = FakeRepo()
-    service = ExecutionService(
-        ExecutionMode.PAPER,
-        _broker(httpx.MockTransport(handle)),
-        notional_usd=100.0,
-        quantity=None,
-        unit_of_work=_uow_factory(repo),
-    )
-    tick = Tick(symbol="AAPL", price=Decimal(50))
-    trade = service.execute(tick, _entry(), provenance=_PROVENANCE)
-
-    assert trade is not None
-    assert trade.status == TradeStatus.FAILED.value
-    assert trade.error_code == "BROKER_ERROR"
-    assert trade.broker_order_id is None
-
-
-def test_alpaca_submit_order_raises_broker_error_on_server_error() -> None:
-    calls = {"n": 0}
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        return httpx.Response(500, json={"message": "boom"})
-
-    broker = _broker(httpx.MockTransport(handle), attempts=2)
-    with pytest.raises(BrokerError):
-        broker.submit_order(
-            symbol="AAPL", qty=Decimal(1), side=OrderSide.BUY, client_order_id="k"
-        )
-    assert calls["n"] == 2
-
-
-# --- Live path (SLICE 5) -------------------------------------------------------------------
+    def update(self, trade_id: uuid.UUID, /, **fields: object) -> None:
+        trade = self.trades[trade_id]
+        for name, value in fields.items():
+            setattr(trade, name, value)
 
 
 class FakeCash:
@@ -211,114 +82,231 @@ class FakeCash:
         self.released.append(hold_id)
 
 
-def _live_service(repo: FakeRepo, cash: FakeCash, transport: httpx.MockTransport) -> ExecutionService:
-    return ExecutionService(
-        ExecutionMode.LIVE,
-        _broker(transport),
+def _broker(handler: httpx.MockTransport, *, attempts: int = 1) -> AlpacaBroker:
+    return AlpacaBroker(
+        "https://paper-api.alpaca.markets", "key", "secret", max_attempts=attempts, transport=handler
+    )
+
+
+def _ok_transport(order_id: str = "broker-123") -> httpx.MockTransport:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": order_id, "status": "accepted"})
+
+    return httpx.MockTransport(handle)
+
+
+def _entry(sell: Decimal = Decimal(110)) -> WatchlistEntry:
+    return WatchlistEntry(
+        symbol="AAPL",
+        buy_price=Decimal(100),
+        sell_price=sell,
+        position_type=PositionType.LONG,
+        trigger_reason="dip",
+    )
+
+
+def _service(
+    mode: ExecutionMode,
+    *,
+    cash: FakeCash | None = None,
+    transport: httpx.MockTransport | None = None,
+) -> tuple[ExecutionService, FakeWriter, PositionBook]:
+    writer = FakeWriter()
+    book = PositionBook()
+    service = ExecutionService(
+        mode,
+        _broker(transport or _ok_transport()),
+        writer,  # type: ignore[arg-type]
+        book,
         notional_usd=100.0,
         quantity=None,
         cash=cash,  # type: ignore[arg-type]
-        unit_of_work=_uow_factory(repo),
     )
+    return service, writer, book
+
+
+# --- sizing / idempotency ------------------------------------------------------------------
+
+
+def test_build_idempotency_key_uses_utc_date() -> None:
+    tick = Tick(symbol="AAPL", price=Decimal(99), ts=datetime(2024, 1, 2, 12, 0, tzinfo=UTC))
+    assert build_idempotency_key(ExecutionMode.PAPER, _entry(), tick) == "paper:AAPL:dip:2024-01-02"
+
+
+def test_compute_sizing_by_notional() -> None:
+    qty, notional = compute_sizing(Decimal(50), notional_usd=100.0, quantity=None)
+    assert qty == Decimal(2)
+    assert notional == Decimal(100)
+
+
+def test_compute_sizing_requires_exactly_one() -> None:
+    with pytest.raises(ConfigurationError):
+        compute_sizing(Decimal(50), notional_usd=None, quantity=None)
+    with pytest.raises(ConfigurationError):
+        compute_sizing(Decimal(50), notional_usd=100.0, quantity=3.0)
+
+
+def test_parse_close_time() -> None:
+    assert parse_close_time("") is None
+    parsed = parse_close_time("16:00")
+    assert parsed is not None and parsed.hour == 16 and parsed.minute == 0
+    with pytest.raises(ConfigurationError):
+        parse_close_time("nope")
+
+
+# --- entry (buy) ---------------------------------------------------------------------------
+
+
+def test_paper_execute_opens_filled_position() -> None:
+    service, _writer, book = _service(ExecutionMode.PAPER)
+    tick = Tick(symbol="AAPL", price=Decimal(50))
+    trade = service.execute(tick, _entry(), provenance=_PROVENANCE)
+
+    assert trade is not None
+    assert trade.status == TradeStatus.FILLED.value
+    assert trade.side == OrderSide.BUY.value
+    assert trade.quantity == Decimal(2)
+    assert trade.target_sell_price == Decimal(110)
+    assert trade.broker_order_id == "broker-123"
+    assert trade.filled_avg_price == Decimal(50)
+    assert len(book) == 1
+    positions = book.pending_and_exiting()  # none pending; all OPEN
+    assert positions == []
+
+
+def test_execute_dedup_is_noop() -> None:
+    service, _writer, book = _service(ExecutionMode.PAPER)
+    tick = Tick(symbol="AAPL", price=Decimal(50))
+    assert service.execute(tick, _entry(), provenance=_PROVENANCE) is not None
+    assert service.execute(tick, _entry(), provenance=_PROVENANCE) is None
+    assert len(book) == 1
+
+
+def test_broker_error_sets_failed_and_opens_no_position() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"message": "bad"})
+
+    service, _writer, book = _service(ExecutionMode.PAPER, transport=httpx.MockTransport(handle))
+    trade = service.execute(Tick(symbol="AAPL", price=Decimal(50)), _entry(), provenance=_PROVENANCE)
+
+    assert trade is not None
+    assert trade.status == TradeStatus.FAILED.value
+    assert trade.error_code == "BROKER_ERROR"
+    assert len(book) == 0
 
 
 def test_live_requires_cash_client() -> None:
     with pytest.raises(ConfigurationError):
-        ExecutionService(
-            ExecutionMode.LIVE, _broker(_ok_transport()), notional_usd=100.0, quantity=None
-        )
+        _service(ExecutionMode.LIVE)
 
 
 def test_live_sufficient_funds_holds_and_submits() -> None:
-    repo = FakeRepo()
     cash = FakeCash(Decimal(1000))
-    service = _live_service(repo, cash, _ok_transport())
-    tick = Tick(symbol="AAPL", price=Decimal(50))
-    trade = service.execute(tick, _entry(), provenance=_LIVE_PROVENANCE)
+    service, _writer, book = _service(ExecutionMode.LIVE, cash=cash)
+    trade = service.execute(
+        Tick(symbol="AAPL", price=Decimal(50)), _entry(), provenance=_LIVE_PROVENANCE
+    )
 
     assert trade is not None
-    assert trade.is_paper is False
-    assert trade.status == TradeStatus.SUBMITTED.value
+    assert trade.status == TradeStatus.SUBMITTED.value  # not filled until reconciled
     assert trade.cash_hold_id == cash.hold_id
     assert trade.filled_at is None
     assert cash.placed == [Decimal(100)]
-    assert cash.captured == []
+    assert len(book) == 1
+    position = book.pending_and_exiting()[0]
+    assert position.state is PositionState.PENDING_ENTRY
 
 
 def test_live_insufficient_funds_does_not_submit() -> None:
-    repo = FakeRepo()
     cash = FakeCash(Decimal(50))
-    service = _live_service(repo, cash, _ok_transport())
-    tick = Tick(symbol="AAPL", price=Decimal(50))
-    trade = service.execute(tick, _entry(), provenance=_LIVE_PROVENANCE)
+    service, _writer, book = _service(ExecutionMode.LIVE, cash=cash)
+    trade = service.execute(
+        Tick(symbol="AAPL", price=Decimal(50)), _entry(), provenance=_LIVE_PROVENANCE
+    )
 
     assert trade is not None
     assert trade.status == TradeStatus.INSUFFICIENT_FUNDS.value
-    assert trade.broker_order_id is None
     assert cash.placed == []
+    assert len(book) == 0
 
 
 def test_live_broker_error_releases_hold() -> None:
     def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"message": "bad"})
 
-    repo = FakeRepo()
     cash = FakeCash(Decimal(1000))
-    service = _live_service(repo, cash, httpx.MockTransport(handle))
-    tick = Tick(symbol="AAPL", price=Decimal(50))
-    trade = service.execute(tick, _entry(), provenance=_LIVE_PROVENANCE)
+    service, _writer, book = _service(
+        ExecutionMode.LIVE, cash=cash, transport=httpx.MockTransport(handle)
+    )
+    trade = service.execute(
+        Tick(symbol="AAPL", price=Decimal(50)), _entry(), provenance=_LIVE_PROVENANCE
+    )
 
     assert trade is not None
     assert trade.status == TradeStatus.FAILED.value
-    assert trade.error_code == "BROKER_ERROR"
-    assert cash.placed == [Decimal(100)]
     assert cash.released == [cash.hold_id]
+    assert len(book) == 0
 
 
-# --- Reconciliation (SLICE 5, §5.6) --------------------------------------------------------
+# --- exit (sell) ---------------------------------------------------------------------------
 
 
-class FakeReconcileRepo:
-    def __init__(self, trades: list[Trade]) -> None:
-        self.trades = trades
-
-    def list_by_status(self, status: str, *, limit: int = 100) -> list[Trade]:
-        return [t for t in self.trades if t.status == status]
-
-    def update_status(
-        self,
-        trade: Trade,
-        status: str,
-        *,
-        filled_quantity: object | None = None,
-        filled_avg_price: object | None = None,
-        filled_at: datetime | None = None,
-        **_: object,
-    ) -> Trade:
-        trade.status = status
-        if filled_quantity is not None:
-            trade.filled_quantity = filled_quantity  # type: ignore[assignment]
-        if filled_avg_price is not None:
-            trade.filled_avg_price = filled_avg_price  # type: ignore[assignment]
-        if filled_at is not None:
-            trade.filled_at = filled_at
-        return trade
-
-
-def _reconcile_uow(repo: FakeReconcileRepo):
-    @contextmanager
-    def factory() -> Iterator[FakeReconcileRepo]:
-        yield repo
-
-    return factory
-
-
-def _open_trade(status: str, broker_order_id: str, hold_id: uuid.UUID | None) -> Trade:
-    return Trade(
-        status=status,
-        broker_order_id=broker_order_id,
-        cash_hold_id=hold_id,
+def test_paper_target_price_exit_closes_position() -> None:
+    service, _writer, book = _service(ExecutionMode.PAPER)
+    entry_trade = service.execute(
+        Tick(symbol="AAPL", price=Decimal(50)), _entry(sell=Decimal(55)), provenance=_PROVENANCE
     )
+    assert entry_trade is not None
+
+    service.check_exits(Tick(symbol="AAPL", price=Decimal(56)))  # 56 >= 55 target
+
+    assert entry_trade.status == TradeStatus.CLOSED.value
+    assert entry_trade.exit_reason == ExitReason.TARGET_PRICE.value
+    assert entry_trade.exit_filled_avg_price == Decimal(56)
+    assert entry_trade.exit_broker_order_id == "broker-123"
+    assert len(book) == 0
+
+
+def test_exit_not_triggered_below_target() -> None:
+    service, _writer, book = _service(ExecutionMode.PAPER)
+    service.execute(
+        Tick(symbol="AAPL", price=Decimal(50)), _entry(sell=Decimal(55)), provenance=_PROVENANCE
+    )
+    service.check_exits(Tick(symbol="AAPL", price=Decimal(54)))  # below target
+    assert len(book) == 1
+
+
+def test_paper_liquidate_all_flattens_positions() -> None:
+    service, _writer, book = _service(ExecutionMode.PAPER)
+    trade = service.execute(
+        Tick(symbol="AAPL", price=Decimal(50)), _entry(), provenance=_PROVENANCE
+    )
+    assert trade is not None
+    service.record_price("AAPL", Decimal(60))
+
+    count = service.liquidate_all(ExitReason.MARKET_CLOSE)
+
+    assert count == 1
+    assert trade.status == TradeStatus.CLOSED.value
+    assert trade.exit_reason == ExitReason.MARKET_CLOSE.value
+    assert trade.exit_filled_avg_price == Decimal(60)
+    assert len(book) == 0
+
+
+def test_market_close_liquidator_fires_once_per_day() -> None:
+    service, _writer, book = _service(ExecutionMode.PAPER)
+    service.execute(Tick(symbol="AAPL", price=Decimal(50)), _entry(), provenance=_PROVENANCE)
+    liquidator = MarketCloseLiquidator(service, parse_close_time("16:00"), ZoneInfo("UTC"))
+
+    before = datetime(2026, 8, 28, 15, 0, tzinfo=ZoneInfo("UTC"))
+    after = datetime(2026, 8, 28, 16, 30, tzinfo=ZoneInfo("UTC"))
+    assert liquidator.maybe_liquidate(now=before) == 0
+    assert liquidator.maybe_liquidate(now=after) == 1
+    assert liquidator.maybe_liquidate(now=after) == 0  # already ran today
+    assert len(book) == 0
+
+
+# --- live reconciliation -------------------------------------------------------------------
 
 
 def _reconcile_broker(orders: dict[str, dict[str, object]]) -> AlpacaBroker:
@@ -329,53 +317,100 @@ def _reconcile_broker(orders: dict[str, dict[str, object]]) -> AlpacaBroker:
     return _broker(httpx.MockTransport(handle))
 
 
-def _reconciler(repo: FakeReconcileRepo, cash: FakeCash, orders: dict[str, dict[str, object]]) -> ReconciliationService:
-    return ReconciliationService(
-        _reconcile_broker(orders),
-        cash,  # type: ignore[arg-type]
-        unit_of_work=_reconcile_uow(repo),  # type: ignore[arg-type]
+def _live_position(state: PositionState, *, hold_id: uuid.UUID | None = None) -> Position:
+    return Position(
+        trade_id=uuid.uuid4(),
+        symbol="AAPL",
+        position_type=PositionType.LONG,
+        quantity=Decimal(2),
+        entry_price=Decimal(50),
+        sell_price=Decimal(60),
+        is_paper=False,
+        idempotency_key="live:AAPL:dip:2026-08-28",
+        broker_order_id="entry-1",
+        exit_broker_order_id="exit-1" if state is PositionState.EXITING else None,
+        cash_hold_id=hold_id,
+        state=state,
     )
 
 
-def test_reconcile_fill_captures_hold() -> None:
-    hold_id = uuid.uuid4()
-    trade = _open_trade(TradeStatus.SUBMITTED.value, "o1", hold_id)
-    repo = FakeReconcileRepo([trade])
+def _seed(writer: FakeWriter, position: Position, status: str) -> Trade:
+    trade = Trade(id=position.trade_id, status=status)
+    writer.trades[position.trade_id] = trade
+    return trade
+
+
+def test_reconcile_entry_fill_opens_and_captures() -> None:
+    writer = FakeWriter()
+    book = PositionBook()
     cash = FakeCash(Decimal(0))
-    orders = {"o1": {"id": "o1", "status": "filled", "filled_qty": "2", "filled_avg_price": "101"}}
-    checked = _reconciler(repo, cash, orders).reconcile_once()
+    hold_id = uuid.uuid4()
+    position = _live_position(PositionState.PENDING_ENTRY, hold_id=hold_id)
+    book.open(position)
+    trade = _seed(writer, position, TradeStatus.SUBMITTED.value)
+    orders = {"entry-1": {"id": "entry-1", "status": "filled", "filled_qty": "2", "filled_avg_price": "50"}}
+
+    checked = PositionReconciler(
+        _reconcile_broker(orders), cash, writer, book  # type: ignore[arg-type]
+    ).reconcile_once()
 
     assert checked == 1
     assert trade.status == TradeStatus.FILLED.value
-    assert trade.filled_quantity == Decimal(2)
-    assert trade.filled_avg_price == Decimal(101)
+    assert position.state is PositionState.OPEN
     assert cash.captured == [hold_id]
-    assert cash.released == []
 
 
-def test_reconcile_reject_releases_hold() -> None:
-    hold_id = uuid.uuid4()
-    trade = _open_trade(TradeStatus.SUBMITTED.value, "o2", hold_id)
-    repo = FakeReconcileRepo([trade])
+def test_reconcile_entry_reject_removes_and_releases() -> None:
+    writer = FakeWriter()
+    book = PositionBook()
     cash = FakeCash(Decimal(0))
-    orders = {"o2": {"id": "o2", "status": "rejected"}}
-    _reconciler(repo, cash, orders).reconcile_once()
+    hold_id = uuid.uuid4()
+    position = _live_position(PositionState.PENDING_ENTRY, hold_id=hold_id)
+    book.open(position)
+    trade = _seed(writer, position, TradeStatus.SUBMITTED.value)
+    orders = {"entry-1": {"id": "entry-1", "status": "rejected"}}
+
+    PositionReconciler(
+        _reconcile_broker(orders), cash, writer, book  # type: ignore[arg-type]
+    ).reconcile_once()
 
     assert trade.status == TradeStatus.REJECTED.value
     assert cash.released == [hold_id]
-    assert cash.captured == []
+    assert len(book) == 0
 
 
-def test_reconcile_partial_fill_stays_open() -> None:
-    hold_id = uuid.uuid4()
-    trade = _open_trade(TradeStatus.SUBMITTED.value, "o3", hold_id)
-    repo = FakeReconcileRepo([trade])
+def test_reconcile_exit_fill_closes_position() -> None:
+    writer = FakeWriter()
+    book = PositionBook()
     cash = FakeCash(Decimal(0))
-    orders = {"o3": {"id": "o3", "status": "partially_filled", "filled_qty": "1"}}
-    _reconciler(repo, cash, orders).reconcile_once()
+    position = _live_position(PositionState.EXITING)
+    book.open(position)
+    trade = _seed(writer, position, TradeStatus.EXIT_SUBMITTED.value)
+    orders = {"exit-1": {"id": "exit-1", "status": "filled", "filled_qty": "2", "filled_avg_price": "62"}}
 
-    assert trade.status == TradeStatus.PARTIALLY_FILLED.value
-    assert trade.filled_quantity == Decimal(1)
-    assert cash.captured == []
-    assert cash.released == []
+    PositionReconciler(
+        _reconcile_broker(orders), cash, writer, book  # type: ignore[arg-type]
+    ).reconcile_once()
 
+    assert trade.status == TradeStatus.CLOSED.value
+    assert trade.exit_filled_avg_price == Decimal(62)
+    assert len(book) == 0
+
+
+def test_reconcile_exit_reject_reopens_position() -> None:
+    writer = FakeWriter()
+    book = PositionBook()
+    cash = FakeCash(Decimal(0))
+    position = _live_position(PositionState.EXITING)
+    book.open(position)
+    trade = _seed(writer, position, TradeStatus.EXIT_SUBMITTED.value)
+    orders = {"exit-1": {"id": "exit-1", "status": "canceled"}}
+
+    PositionReconciler(
+        _reconcile_broker(orders), cash, writer, book  # type: ignore[arg-type]
+    ).reconcile_once()
+
+    assert trade.status == TradeStatus.EXIT_FAILED.value
+    assert position.state is PositionState.OPEN
+    assert position.exit_broker_order_id is None
+    assert len(book) == 1

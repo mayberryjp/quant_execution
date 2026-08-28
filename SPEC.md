@@ -220,6 +220,15 @@ NEW ─► CASH_HELD ─► SUBMITTED ─► FILLED
 - **live**: `NEW → CASH_HELD → SUBMITTED`, then a reconciliation loop polls Alpaca and advances to
   `FILLED` / `PARTIALLY_FILLED` / `REJECTED`. On terminal reject/cancel, the cash hold is released.
 
+After an entry fills, the position is **held** until it exits (§5.7):
+```
+FILLED ─► EXIT_SUBMITTED ─► CLOSED
+              │          └► EXIT_PARTIALLY_FILLED ─► CLOSED
+              └► EXIT_FAILED ─► (position reopened, retried on next trigger / at close)
+```
+- **paper** exits record `EXIT_SUBMITTED → CLOSED` immediately (fill assumed).
+- **live** exits are confirmed by the same reconciliation loop.
+
 ---
 
 ## 4. External Integrations
@@ -315,7 +324,30 @@ A background loop (part of `executor_live`) polls `get_order(broker_order_id)` f
 `SUBMITTED`/`PARTIALLY_FILLED`, updates `status`/`filled_*`, and on terminal state:
 - `FILLED` → `cash_client.capture_hold(cash_hold_id)`.
 - `REJECTED`/`CANCELED` → `cash_client.release_hold(cash_hold_id)`.
-Poll interval and max age are config-driven; the loop is idempotent and bounded.
+Poll interval and max age are config-driven; the loop is idempotent and bounded. The same loop also
+confirms live **exit** orders (`EXIT_SUBMITTED`/`EXIT_PARTIALLY_FILLED` → `CLOSED`; terminal reject
+reopens the position for retry).
+
+### 5.7 Position lifecycle: hold, target-price exit, and market-close liquidation
+The streaming hot path is **in-memory first**. An in-memory `PositionBook` (per-symbol, lock-guarded)
+is the source of truth for open positions and holds order state, type, symbol, buy/sell prices,
+executed status, and shares. Every durable change is handed to a **non-blocking `AsyncDbWriter`**
+(single FIFO queue drained by one background thread, batched into transactions); a full queue drops
+the write and logs rather than stalling the tick loop. The entry row is **updated in place** as the
+position closes.
+
+- **Watchlist** entries now carry a required `sell_price`. On each tick the service records the
+  latest price, opens positions on buy matches (§5.5), and calls `check_exits(tick)`.
+- **Target-price exit**: when a streaming price reaches a held position's `sell_price` (LONG:
+  `price >= sell_price`; SHORT: `price <= sell_price`), an exit order is submitted for the position's
+  `exit_side` (opposite of entry), monitored, and persisted (`EXIT_SUBMITTED` → `CLOSED`).
+- **Market-close liquidation**: at the configured close time (**separate for paper and live**), a
+  per-mode liquidator submits immediate market exits for **all** open positions once per day. Empty
+  close time disables liquidation for that mode.
+- **Restart safety**: on startup, open trades (`CASH_HELD`/`SUBMITTED`/`PARTIALLY_FILLED`/`FILLED`/
+  `EXIT_SUBMITTED`/`EXIT_PARTIALLY_FILLED`) are rehydrated into the `PositionBook` and their
+  idempotency keys seeded so restarts never re-buy.
+- Designed for hundreds of symbols and ticks/second: in-memory matching + claim, non-blocking writes.
 
 ---
 
@@ -359,6 +391,12 @@ Per Backend Coding Standards §9 (shared database):
 | `EXEC_ORDER_QUANTITY` | — | fixed per-order share count |
 | `EXEC_PRICE_MATCH_TOLERANCE` | `0` | match band (abs or bps) |
 | `EXEC_ALPACA_POLL_SECONDS` | `5` | live reconciliation poll interval |
+| `EXEC_MARKET_TIMEZONE` | `America/New_York` | tz for market-close evaluation |
+| `EXEC_MARKET_CLOSE_PAPER` | — (required) | paper close time `HH:MM` (empty disables liquidation) |
+| `EXEC_MARKET_CLOSE_LIVE` | — (required) | live close time `HH:MM` (empty disables liquidation) |
+| `EXEC_MARKET_CLOSE_CHECK_SECONDS` | `30` | liquidator poll interval |
+| `EXEC_DB_WRITER_BATCH_SIZE` | `200` | max writes flushed per transaction |
+| `EXEC_DB_WRITER_QUEUE_SIZE` | `100000` | async writer queue capacity (full → drop + log) |
 | `EXEC_API_LISTEN_ADDRESS` | `0.0.0.0` | health API bind |
 | `EXEC_API_PORT` | `8000` | health API port |
 | `EXEC_LOG_LEVEL` | `INFO` | logging |

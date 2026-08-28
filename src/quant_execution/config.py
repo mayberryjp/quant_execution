@@ -61,6 +61,18 @@ class Settings(BaseSettings):
     # Live reconciliation.
     alpaca_poll_seconds: int = 5
 
+    # Position exit / market close. Close times are ``HH:MM`` in ``market_timezone``; empty
+    # disables auto-liquidation for that mode. Both executors auto-exit all open positions at
+    # their own close time so nothing is carried past the session.
+    market_timezone: str = "America/New_York"
+    market_close_paper: str = ""
+    market_close_live: str = ""
+    market_close_check_seconds: int = 30
+
+    # Non-blocking DB writer (in-memory position book is the hot-path source of truth).
+    db_writer_batch_size: int = 200
+    db_writer_queue_size: int = 100_000
+
     def missing_readiness_config(self) -> list[str]:
         """Return required downstream settings that are unset (SPEC.md §8).
 
@@ -73,6 +85,8 @@ class Settings(BaseSettings):
             "EXEC_ALPACA_API_SECRET": self.alpaca_api_secret,
             "EXEC_CASH_API_URL": self.cash_api_url,
             "EXEC_CASH_ACCOUNT_ID": self.cash_account_id,
+            "EXEC_MARKET_CLOSE_PAPER": self.market_close_paper,
+            "EXEC_MARKET_CLOSE_LIVE": self.market_close_live,
         }
         return [name for name, value in required.items() if not value]
 

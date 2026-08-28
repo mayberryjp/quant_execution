@@ -59,6 +59,14 @@ class Trade(Base):
     filled_quantity: Mapped[Decimal | None] = mapped_column(_NUM, nullable=True)
     filled_avg_price: Mapped[Decimal | None] = mapped_column(_NUM, nullable=True)
 
+    # Exit / sell side. The entry row is updated in place when the position is closed
+    # (target price hit or market-close liquidation); see SPEC.md §5.7.
+    target_sell_price: Mapped[Decimal | None] = mapped_column(_NUM, nullable=True)
+    exit_broker_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    exit_filled_quantity: Mapped[Decimal | None] = mapped_column(_NUM, nullable=True)
+    exit_filled_avg_price: Mapped[Decimal | None] = mapped_column(_NUM, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     cash_hold_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
@@ -81,6 +89,12 @@ class Trade(Base):
         DateTime(timezone=True), nullable=True
     )
     filled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    exit_submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     updated_at: Mapped[datetime] = mapped_column(
