@@ -6,10 +6,11 @@ never reads, writes, or migrates another service's tables.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -65,3 +66,18 @@ def check_database() -> tuple[bool, str]:
         return True, "ok"
     except SQLAlchemyError as exc:
         return False, f"database check failed: {type(exc).__name__}"
+
+
+def wait_for_table(table: str, *, timeout: float = 60.0, interval: float = 1.0) -> bool:
+    """Block until ``table`` exists so startup never races the migrate step (returns readiness)."""
+    engine = get_engine()
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if inspect(engine).has_table(table):
+                return True
+        except SQLAlchemyError:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)

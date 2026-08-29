@@ -22,7 +22,7 @@ from quant_execution.clients.alpaca_client import AlpacaBroker
 from quant_execution.clients.cash_client import CashClient
 from quant_execution.clients.watchlist_client import WatchlistClient
 from quant_execution.config import settings
-from quant_execution.db import session_scope
+from quant_execution.db import session_scope, wait_for_table
 from quant_execution.domain.enums import ExecutionMode
 from quant_execution.domain.matching import WatchlistRefresher, WatchlistStore
 from quant_execution.domain.positions import PositionBook
@@ -123,6 +123,8 @@ def main() -> None:
         quantity=settings.order_quantity,
         cash=cash,
     )
+    if not wait_for_table("trades"):
+        log.warning("trades table not present after wait; continuing (writes may fail until migrated)")
     rehydrate_positions(mode, service, log)
 
     stop_event = threading.Event()
