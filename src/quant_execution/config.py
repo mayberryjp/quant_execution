@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     alpaca_api_secret: str = ""
 
     # Order sizing — exactly one is used (validated where sizing is applied).
-    order_notional_usd: float | None = None
+    order_notional_usd: float | None = 1000.0
     order_quantity: float | None = None
 
     # Matching.
