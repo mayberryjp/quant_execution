@@ -63,5 +63,5 @@ class WatchlistClient:
         except ValueError as exc:
             raise WatchlistError(f"watchlist returned invalid JSON: {exc}") from exc
 
-        records = payload if isinstance(payload, list) else payload.get("items", [])
+        records = payload if isinstance(payload, list) else payload.get("results", [])
         return [WatchlistEntry.model_validate(record) for record in records]

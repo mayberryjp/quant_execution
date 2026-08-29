@@ -40,15 +40,15 @@ def test_fetch_active_follows_pagination() -> None:
     assert entries[0].buy_price == Decimal(100)
 
 
-def test_fetch_active_accepts_items_envelope() -> None:
+def test_fetch_active_accepts_results_envelope() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         offset = int(request.url.params["offset"])
         if offset == 0:
             return httpx.Response(
                 200,
-                json={"items": [{"symbol": "AAPL", "buy_price": "10", "sell_price": "12", "position_type": "LONG"}]},
+                json={"results": [{"symbol": "AAPL", "buy_price": "10", "sell_price": "12", "position_type": "LONG"}]},
             )
-        return httpx.Response(200, json={"items": []})
+        return httpx.Response(200, json={"results": []})
 
     entries = _client(handler, page_size=1).fetch_active()
     assert len(entries) == 1
