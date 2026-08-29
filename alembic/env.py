@@ -4,8 +4,8 @@ Race-safety and shared-database rules (see SPEC.md §6):
 - A service-specific version table (``alembic_version_quant_execution``) keeps this service's
   migration history independent inside the shared Postgres database.
 - ``include_object`` restricts migrations to this service's own tables.
-- Online migrations acquire a Postgres advisory lock so that concurrent migrators (multiple
-  replicas/containers) serialize; the loser sees head and no-ops.
+- Online migrations acquire a transaction-scoped Postgres advisory lock so that concurrent
+  migrators (multiple replicas/containers) serialize; the loser sees head and no-ops.
 """
 
 from __future__ import annotations
@@ -64,28 +64,31 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        connection.execute(text("SELECT pg_advisory_lock(:k)"), {"k": MIGRATION_LOCK_KEY})
-        try:
-            context.configure(
-                connection=connection,
-                target_metadata=target_metadata,
-                version_table=VERSION_TABLE,
-                version_table_schema=VERSION_TABLE_SCHEMA,
-                include_object=include_object,
-                include_schemas=True,
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            version_table=VERSION_TABLE,
+            version_table_schema=VERSION_TABLE_SCHEMA,
+            include_object=include_object,
+            include_schemas=True,
+        )
+        # Nothing must run on the connection before begin_transaction, otherwise SQLAlchemy
+        # autobegins a transaction that Alembic treats as externally managed and never
+        # commits. Alembic owns (and commits) this transaction.
+        with context.begin_transaction():
+            # Transaction-scoped lock serializes concurrent migrators; auto-released on commit.
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:k)"), {"k": MIGRATION_LOCK_KEY}
             )
-            with context.begin_transaction():
-                # Create this service's schema before Alembic creates its version table
-                # inside it, and route the unqualified migration DDL there.
-                connection.execute(
-                    text(f'CREATE SCHEMA IF NOT EXISTS "{VERSION_TABLE_SCHEMA}"')
-                )
-                connection.execute(
-                    text(f'SET search_path TO "{VERSION_TABLE_SCHEMA}", public')
-                )
-                context.run_migrations()
-        finally:
-            connection.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": MIGRATION_LOCK_KEY})
+            # Create this service's schema before Alembic creates its version table inside
+            # it, and route the unqualified migration DDL there.
+            connection.execute(
+                text(f'CREATE SCHEMA IF NOT EXISTS "{VERSION_TABLE_SCHEMA}"')
+            )
+            connection.execute(
+                text(f'SET search_path TO "{VERSION_TABLE_SCHEMA}", public')
+            )
+            context.run_migrations()
 
 
 if context.is_offline_mode():
