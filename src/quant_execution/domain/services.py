@@ -91,6 +91,14 @@ def parse_close_time(raw: str) -> clock_time | None:
         raise ConfigurationError(f"invalid market close time {raw!r}; expected HH:MM") from exc
 
 
+def shift_earlier(t: clock_time | None, minutes: int) -> clock_time | None:
+    """Return ``t`` moved ``minutes`` earlier (wrapping past midnight); ``None`` passes through."""
+    if t is None:
+        return None
+    total = (t.hour * 60 + t.minute - minutes) % (24 * 60)
+    return clock_time(hour=total // 60, minute=total % 60)
+
+
 def position_from_trade(trade: Trade) -> Position:
     """Rebuild an in-memory position from a persisted open trade (startup rehydration)."""
     if trade.status in _OPEN_STATUSES:

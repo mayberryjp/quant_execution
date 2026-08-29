@@ -34,6 +34,7 @@ from quant_execution.domain.services import (
     build_idempotency_key,
     compute_sizing,
     parse_close_time,
+    shift_earlier,
 )
 from quant_execution.kafka.consumer import MessageMeta
 from quant_execution.repository.models import Trade
@@ -152,6 +153,14 @@ def test_parse_close_time() -> None:
     assert parsed is not None and parsed.hour == 16 and parsed.minute == 0
     with pytest.raises(ConfigurationError):
         parse_close_time("nope")
+
+
+def test_shift_earlier() -> None:
+    assert shift_earlier(None, 15) is None
+    assert shift_earlier(parse_close_time("11:00"), 15) == parse_close_time("10:45")
+    assert shift_earlier(parse_close_time("22:30"), 15) == parse_close_time("22:15")
+    # Wraps past midnight.
+    assert shift_earlier(parse_close_time("00:05"), 15) == parse_close_time("23:50")
 
 
 # --- entry (buy) ---------------------------------------------------------------------------

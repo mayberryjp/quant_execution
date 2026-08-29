@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -69,6 +70,19 @@ def test_tick_parse_valid() -> None:
     tick = Tick.parse(b'{"symbol": "AAPL", "price": "99.5", "ts": "2024-01-02T00:00:00Z"}')
     assert tick.symbol == "AAPL"
     assert tick.price == Decimal("99.5")
+
+
+def test_tick_parse_streamingchart_bar() -> None:
+    raw = (
+        b'{"schema_version": 1, "session_id": 123, "ticker": "MSFT", "sequence": 0,'
+        b' "interval": "1m", "bar_time": "2026-08-28T13:30:00Z", "open": 100.1,'
+        b' "high": 100.5, "low": 99.9, "close": 100.3, "volume": 12345,'
+        b' "emitted_at": "2026-08-29T02:00:00Z", "is_first": true, "is_last": false}'
+    )
+    tick = Tick.parse(raw)
+    assert tick.symbol == "MSFT"
+    assert tick.price == Decimal("100.3")
+    assert tick.ts == datetime(2026, 8, 28, 13, 30, tzinfo=UTC)
 
 
 def test_tick_parse_malformed_raises() -> None:

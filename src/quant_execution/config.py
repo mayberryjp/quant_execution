@@ -40,7 +40,10 @@ class Settings(BaseSettings):
     kafka_topic_live: str = "ticks.live"
     kafka_group_prefix: str = "quant-execution"
 
-    # Watchlist (quant_stickynote).
+    # Watchlist (quant_stickynote). The sticky note is reloaded once per session at market open
+    # (per mode, see ``market_open_paper``/``market_open_live``) plus once at startup so a
+    # restart is never left with an empty watchlist. ``watchlist_refresh_seconds`` is the
+    # clock-check cadence of that scheduler, not an unconditional refresh interval.
     watchlist_api_url: str = ""
     watchlist_refresh_seconds: int = 60
 
@@ -63,10 +66,14 @@ class Settings(BaseSettings):
     # Live reconciliation.
     alpaca_poll_seconds: int = 5
 
-    # Position exit / market close. Close times are ``HH:MM`` in ``market_timezone``; empty
-    # disables auto-liquidation for that mode. Both executors auto-exit all open positions at
-    # their own close time so nothing is carried past the session.
+    # Market schedule. Open/close times are ``HH:MM`` in ``market_timezone``. The open time (per
+    # mode) triggers the once-per-session watchlist reload; an empty open time disables the
+    # scheduled reload (startup load only). The close time (per mode) auto-liquidates all open
+    # positions; empty disables auto-liquidation for that mode. Both executors run concurrently,
+    # so each mode has its own open/close.
     market_timezone: str = "America/New_York"
+    market_open_paper: str = ""
+    market_open_live: str = ""
     market_close_paper: str = ""
     market_close_live: str = ""
     market_close_check_seconds: int = 30

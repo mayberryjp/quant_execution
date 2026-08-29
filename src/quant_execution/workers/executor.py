@@ -34,6 +34,7 @@ from quant_execution.domain.services import (
     PositionReconciler,
     parse_close_time,
     position_from_trade,
+    shift_earlier,
 )
 from quant_execution.kafka.consumer import MessageMeta, TickConsumer, create_consumer
 from quant_execution.logging import configure_logging, get_logger
@@ -41,6 +42,10 @@ from quant_execution.repository.async_writer import AsyncDbWriter
 from quant_execution.repository.trades_repo import TradesRepository
 
 VALID_MODES = tuple(m.value for m in ExecutionMode)
+
+# Both the pre-session watchlist reload and the market-close liquidation fire this many minutes
+# before their configured market open/close time.
+SESSION_LEAD_MINUTES = 15
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -99,8 +104,14 @@ def main() -> None:
 
     store = WatchlistStore(tolerance=Decimal(str(settings.price_match_tolerance)))
     watchlist_client = WatchlistClient(settings.watchlist_api_url)
+    open_raw = settings.market_open_paper if mode.is_paper else settings.market_open_live
+    open_time = shift_earlier(parse_close_time(open_raw), SESSION_LEAD_MINUTES)
     refresher = WatchlistRefresher(
-        store, watchlist_client.fetch_active, settings.watchlist_refresh_seconds
+        store,
+        watchlist_client.fetch_active,
+        open_time,
+        ZoneInfo(settings.market_timezone),
+        check_seconds=float(settings.watchlist_refresh_seconds),
     )
 
     broker = AlpacaBroker(
@@ -132,6 +143,13 @@ def main() -> None:
 
     threading.Thread(target=writer.run_forever, args=(stop_event,), daemon=True).start()
     threading.Thread(target=refresher.run_forever, args=(stop_event,), daemon=True).start()
+    log.info(
+        "watchlist refresher armed trigger=%s (%dm before open=%s) tz=%s",
+        open_time,
+        SESSION_LEAD_MINUTES,
+        open_raw,
+        settings.market_timezone,
+    )
 
     if not mode.is_paper and cash is not None:
         reconciler = PositionReconciler(broker, cash, writer, book)
@@ -143,14 +161,21 @@ def main() -> None:
         log.info("reconciliation loop started interval=%ss", settings.alpaca_poll_seconds)
 
     close_raw = settings.market_close_paper if mode.is_paper else settings.market_close_live
+    close_time = shift_earlier(parse_close_time(close_raw), SESSION_LEAD_MINUTES)
     liquidator = MarketCloseLiquidator(
         service,
-        parse_close_time(close_raw),
+        close_time,
         ZoneInfo(settings.market_timezone),
         check_seconds=float(settings.market_close_check_seconds),
     )
     threading.Thread(target=liquidator.run_forever, args=(stop_event,), daemon=True).start()
-    log.info("market close liquidator armed close=%s tz=%s", close_raw, settings.market_timezone)
+    log.info(
+        "market close liquidator armed trigger=%s (%dm before close=%s) tz=%s",
+        close_time,
+        SESSION_LEAD_MINUTES,
+        close_raw,
+        settings.market_timezone,
+    )
 
     topic = settings.kafka_topic_paper if mode.is_paper else settings.kafka_topic_live
     group_id = f"{settings.kafka_group_prefix}.{mode}"

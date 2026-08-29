@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import threading
+from datetime import datetime
+from datetime import time as clock_time
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from quant_execution.domain.enums import PositionType
 from quant_execution.domain.matching import (
@@ -78,14 +81,16 @@ def test_refresh_swaps_snapshot_atomically() -> None:
     refresher = WatchlistRefresher(
         store,
         fetcher=lambda: [_entry("MSFT", "50", PositionType.SHORT)],
-        interval_seconds=0.01,
+        open_time=None,
+        tz=ZoneInfo("UTC"),
+        check_seconds=0.01,
     )
     count = refresher.refresh_once()
     assert count == 1
     assert store.symbols == {"MSFT"}
 
 
-def test_run_forever_stops_on_event() -> None:
+def test_run_forever_loads_at_startup_and_stops_on_event() -> None:
     store = WatchlistStore()
     calls = {"n": 0}
 
@@ -94,7 +99,9 @@ def test_run_forever_stops_on_event() -> None:
         return []
 
     stop = threading.Event()
-    refresher = WatchlistRefresher(store, fetcher=fetcher, interval_seconds=0.01)
+    refresher = WatchlistRefresher(
+        store, fetcher=fetcher, open_time=None, tz=ZoneInfo("UTC"), check_seconds=0.01
+    )
 
     def run() -> None:
         refresher.run_forever(stop)
@@ -104,4 +111,44 @@ def test_run_forever_stops_on_event() -> None:
     stop.set()
     thread.join(timeout=2)
     assert not thread.is_alive()
+    # A single startup load happens even with no scheduled open time.
     assert calls["n"] >= 1
+
+
+def test_scheduled_refresh_fires_once_per_day_at_open() -> None:
+    store = WatchlistStore()
+    calls = {"n": 0}
+
+    def fetcher() -> list[WatchlistEntry]:
+        calls["n"] += 1
+        return [_entry("AAPL", "100", PositionType.LONG)]
+
+    tz = ZoneInfo("UTC")
+    refresher = WatchlistRefresher(
+        store, fetcher=fetcher, open_time=clock_time(9, 30), tz=tz, check_seconds=0.01
+    )
+
+    # Before open: no reload.
+    assert refresher.maybe_refresh(datetime(2026, 1, 2, 9, 0, tzinfo=tz)) == 0
+    assert calls["n"] == 0
+    # At/after open: reload once.
+    assert refresher.maybe_refresh(datetime(2026, 1, 2, 9, 30, tzinfo=tz)) == 1
+    assert calls["n"] == 1
+    # Same day, later: no second reload.
+    assert refresher.maybe_refresh(datetime(2026, 1, 2, 15, 0, tzinfo=tz)) == 0
+    assert calls["n"] == 1
+    # Next day at open: reload again.
+    assert refresher.maybe_refresh(datetime(2026, 1, 3, 9, 30, tzinfo=tz)) == 1
+    assert calls["n"] == 2
+
+
+def test_scheduled_refresh_disabled_when_open_time_none() -> None:
+    store = WatchlistStore()
+    refresher = WatchlistRefresher(
+        store,
+        fetcher=lambda: [_entry("AAPL", "100", PositionType.LONG)],
+        open_time=None,
+        tz=ZoneInfo("UTC"),
+        check_seconds=0.01,
+    )
+    assert refresher.maybe_refresh(datetime(2026, 1, 2, 9, 30, tzinfo=ZoneInfo("UTC"))) == 0

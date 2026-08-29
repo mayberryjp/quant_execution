@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from quant_execution.domain.enums import OrderSide, PositionType
 from quant_execution.repository.models import Trade
@@ -25,11 +25,18 @@ class WatchlistEntry(BaseModel):
 
 
 class Tick(BaseModel):
-    """A single streaming price tick consumed from Kafka (SPEC.md §5.1)."""
+    """A single streaming price tick consumed from Kafka (SPEC.md §5.1).
 
-    symbol: str
-    price: Decimal
-    ts: datetime | None = None
+    The paper streamingchart emits OHLC bars (``ticker``/``close``/``bar_time``); the bar close is
+    taken as the current price. Aliases accept that shape while ignoring the other bar fields
+    (``schema_version``, ``sequence``, ``open``/``high``/``low``, ``volume``, ...).
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(validation_alias=AliasChoices("symbol", "ticker"))
+    price: Decimal = Field(validation_alias=AliasChoices("price", "close"))
+    ts: datetime | None = Field(default=None, validation_alias=AliasChoices("ts", "bar_time"))
 
     @classmethod
     def parse(cls, raw: bytes | str) -> Tick:

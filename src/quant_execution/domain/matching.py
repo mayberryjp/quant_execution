@@ -15,7 +15,10 @@ from __future__ import annotations
 import threading
 from collections import defaultdict
 from collections.abc import Callable
+from datetime import date, datetime
+from datetime import time as clock_time
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from quant_execution.domain.enums import PositionType
 from quant_execution.domain.schemas import WatchlistEntry
@@ -62,9 +65,14 @@ class WatchlistStore:
 
 
 class WatchlistRefresher:
-    """Periodically reloads the store from a fetcher (SPEC.md §4.1 refresh loop).
+    """Reloads the store from a fetcher once per session at market open (SPEC.md §4.1).
 
-    The fetcher is any zero-arg callable returning the current entries (typically
+    Execution only needs the sticky note right before a trading session begins, so instead of
+    polling continuously it reloads once per day at/after ``open_time`` (in ``tz``). One load is
+    also performed at startup so a restart mid-session is never left with an empty watchlist.
+    ``check_seconds`` is only the clock-check cadence; the network fetch happens at startup and
+    once per day at open. An ``open_time`` of ``None`` disables the scheduled reload (startup
+    load only). The fetcher is any zero-arg callable returning the current entries (typically
     ``WatchlistClient.fetch_active``), keeping this loop free of network concerns for testing.
     """
 
@@ -72,11 +80,17 @@ class WatchlistRefresher:
         self,
         store: WatchlistStore,
         fetcher: Callable[[], list[WatchlistEntry]],
-        interval_seconds: float,
+        open_time: clock_time | None,
+        tz: ZoneInfo,
+        *,
+        check_seconds: float = 30.0,
     ) -> None:
         self._store = store
         self._fetcher = fetcher
-        self._interval = interval_seconds
+        self._open_time = open_time
+        self._tz = tz
+        self._check_seconds = check_seconds
+        self._last_run: date | None = None
 
     def refresh_once(self) -> int:
         """Fetch and atomically swap the snapshot; return the entry count loaded."""
@@ -85,11 +99,33 @@ class WatchlistRefresher:
         logger.info("watchlist refreshed entries=%d symbols=%d", len(entries), len(self._store.symbols))
         return len(entries)
 
+    def maybe_refresh(self, now: datetime | None = None) -> int:
+        """Reload if we are at/after the open time and have not already done so today."""
+        if self._open_time is None:
+            return 0
+        moment = now or datetime.now(self._tz)
+        today = moment.date()
+        if moment.time() >= self._open_time and self._last_run != today:
+            self._last_run = today
+            return self.refresh_once()
+        return 0
+
     def run_forever(self, stop_event: threading.Event) -> None:
-        """Refresh immediately, then every ``interval_seconds`` until ``stop_event`` is set."""
+        """Load once at startup, then reload once per day at open until ``stop_event`` is set."""
+        try:
+            self.refresh_once()
+        except Exception:
+            logger.exception("watchlist refresh failed; keeping previous snapshot")
+        # If we started at/after today's open, the startup load covers this session; don't reload
+        # again until tomorrow's open. Starting before open leaves ``_last_run`` unset so the open
+        # reload still fires.
+        if self._open_time is not None:
+            now = datetime.now(self._tz)
+            if now.time() >= self._open_time:
+                self._last_run = now.date()
         while not stop_event.is_set():
             try:
-                self.refresh_once()
+                self.maybe_refresh()
             except Exception:
                 logger.exception("watchlist refresh failed; keeping previous snapshot")
-            stop_event.wait(self._interval)
+            stop_event.wait(self._check_seconds)

@@ -236,8 +236,13 @@ FILLED ─► EXIT_SUBMITTED ─► CLOSED
 ### 4.1 Watchlist — `quant_stickynote`
 - `GET /sticky-notes?status=active&limit=...&offset=...` → list of
   `{ symbol, buy_price, position_type, source_query_id, trigger_reason, status }`.
-- Loaded fully into an in-memory `WatchlistStore` on startup and refreshed every
-  `EXEC_WATCHLIST_REFRESH_SECONDS`. Refresh is atomic (build new snapshot, swap reference).
+- Loaded fully into an in-memory `WatchlistStore` once at startup, then reloaded once per
+  session **15 minutes before** market open (per mode, `EXEC_MARKET_OPEN_PAPER` /
+  `EXEC_MARKET_OPEN_LIVE` in `EXEC_MARKET_TIMEZONE`). The startup load keeps a restart from
+  running with an empty watchlist; the scheduled reload picks up the latest sticky notes right
+  before trading begins. `EXEC_WATCHLIST_REFRESH_SECONDS` is only the clock-check cadence of
+  that scheduler, not an unconditional refresh interval; an empty open time disables the
+  scheduled reload (startup load only). Refresh is atomic (build new snapshot, swap reference).
 - A symbol may have multiple entries (different `trigger_reason`); all are armed independently.
 
 ### 4.2 Cash — `quant_cash` (live only)
@@ -270,6 +275,12 @@ for msg in consumer(topic, group):
         execution_service.execute(tick, entry, provenance=msg_meta)
     consumer.commit()                           # at-least-once; idempotency guards dupes
 ```
+
+The paper streamingchart emits OHLC bars, so the tick parser accepts that shape via aliases
+(`ticker`→symbol, `close`→price, `bar_time`→ts) and ignores the remaining bar fields
+(`schema_version`, `sequence`, `open`/`high`/`low`, `volume`, `emitted_at`, `is_first`/`is_last`).
+The bar **close** is used as the current price. The legacy `{symbol, price, ts}` shape is still
+accepted.
 
 ### 5.2 Match rule (`domain/matching.py`)
 - **LONG** entry arms a **BUY** when `tick.price <= buy_price` (price reached/entry crossed down).
@@ -341,9 +352,9 @@ position closes.
 - **Target-price exit**: when a streaming price reaches a held position's `sell_price` (LONG:
   `price >= sell_price`; SHORT: `price <= sell_price`), an exit order is submitted for the position's
   `exit_side` (opposite of entry), monitored, and persisted (`EXIT_SUBMITTED` → `CLOSED`).
-- **Market-close liquidation**: at the configured close time (**separate for paper and live**), a
-  per-mode liquidator submits immediate market exits for **all** open positions once per day. Empty
-  close time disables liquidation for that mode.
+- **Market-close liquidation**: **15 minutes before** the configured close time (**separate for
+  paper and live**), a per-mode liquidator submits immediate market exits for **all** open
+  positions once per day. Empty close time disables liquidation for that mode.
 - **Restart safety**: on startup, open trades (`CASH_HELD`/`SUBMITTED`/`PARTIALLY_FILLED`/`FILLED`/
   `EXIT_SUBMITTED`/`EXIT_PARTIALLY_FILLED`) are rehydrated into the `PositionBook` and their
   idempotency keys seeded so restarts never re-buy.
@@ -381,7 +392,7 @@ Per Backend Coding Standards §9 (shared database):
 | `EXEC_KAFKA_TOPIC_LIVE` | `ticks.live` | live tick topic |
 | `EXEC_KAFKA_GROUP_PREFIX` | `quant-execution` | consumer group prefix (mode appended) |
 | `EXEC_WATCHLIST_API_URL` | — (required) | `quant_stickynote` base URL |
-| `EXEC_WATCHLIST_REFRESH_SECONDS` | `60` | in-memory refresh interval |
+| `EXEC_WATCHLIST_REFRESH_SECONDS` | `60` | watchlist scheduler clock-check cadence |
 | `EXEC_CASH_API_URL` | — (required for live) | `quant_cash` base URL |
 | `EXEC_CASH_ACCOUNT_ID` | — (required for live) | account to check/hold |
 | `EXEC_ALPACA_BASE_URL` | Alpaca paper URL | broker endpoint |
@@ -391,9 +402,11 @@ Per Backend Coding Standards §9 (shared database):
 | `EXEC_ORDER_QUANTITY` | — | fixed per-order share count |
 | `EXEC_PRICE_MATCH_TOLERANCE` | `0` | match band (abs or bps) |
 | `EXEC_ALPACA_POLL_SECONDS` | `5` | live reconciliation poll interval |
-| `EXEC_MARKET_TIMEZONE` | `America/New_York` | tz for market-close evaluation |
-| `EXEC_MARKET_CLOSE_PAPER` | — (required) | paper close time `HH:MM` (empty disables liquidation) |
-| `EXEC_MARKET_CLOSE_LIVE` | — (required) | live close time `HH:MM` (empty disables liquidation) |
+| `EXEC_MARKET_TIMEZONE` | `America/New_York` | tz for market-open/close evaluation |
+| `EXEC_MARKET_OPEN_PAPER` | — | paper open time `HH:MM`; watchlist reloads 15m before (empty disables scheduled reload) |
+| `EXEC_MARKET_OPEN_LIVE` | — | live open time `HH:MM`; watchlist reloads 15m before (empty disables scheduled reload) |
+| `EXEC_MARKET_CLOSE_PAPER` | — (required) | paper close time `HH:MM`; positions liquidate 15m before (empty disables liquidation) |
+| `EXEC_MARKET_CLOSE_LIVE` | — (required) | live close time `HH:MM`; positions liquidate 15m before (empty disables liquidation) |
 | `EXEC_MARKET_CLOSE_CHECK_SECONDS` | `30` | liquidator poll interval |
 | `EXEC_DB_WRITER_BATCH_SIZE` | `200` | max writes flushed per transaction |
 | `EXEC_DB_WRITER_QUEUE_SIZE` | `100000` | async writer queue capacity (full → drop + log) |
