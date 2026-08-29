@@ -19,6 +19,16 @@ def create_app() -> Bottle:
     register_health_routes(app)
     register_trade_routes(app)
 
+    @app.hook("after_request")
+    def _add_cors_headers() -> None:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Origin, Content-Type, Accept, Authorization"
+
+    @app.route("/<path:path>", method="OPTIONS")
+    def _cors_preflight(path: str) -> str:
+        return ""
+
     @app.error(404)
     def not_found(_err: Any) -> str:
         response.content_type = "application/json"
