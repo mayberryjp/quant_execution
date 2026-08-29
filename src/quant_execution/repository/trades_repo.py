@@ -101,3 +101,24 @@ class TradesRepository:
             .limit(limit)
         )
         return list(self._session.execute(stmt).scalars().all())
+
+    def list_history(
+        self,
+        *,
+        is_paper: bool | None = None,
+        status: str | None = None,
+        symbol: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Trade]:
+        """Most-recent-first trade history with optional mode/status/symbol filters."""
+        stmt = select(Trade)
+        if is_paper is not None:
+            stmt = stmt.where(Trade.is_paper == is_paper)
+        if status is not None:
+            stmt = stmt.where(Trade.status == status)
+        if symbol is not None:
+            stmt = stmt.where(Trade.symbol == symbol)
+        stmt = stmt.order_by(Trade.created_at.desc()).limit(limit).offset(offset)
+        return list(self._session.execute(stmt).scalars().all())
+

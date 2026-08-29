@@ -153,7 +153,7 @@ def main() -> None:
     )
 
     if not mode.is_paper and cash is not None:
-        reconciler = PositionReconciler(broker, cash, writer, book)
+        reconciler = PositionReconciler(broker, cash, writer, book, on_close=service.forget)
         threading.Thread(
             target=reconciler.run_forever,
             args=(stop_event, float(settings.alpaca_poll_seconds)),

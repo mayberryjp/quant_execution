@@ -176,7 +176,7 @@ def test_paper_execute_opens_filled_position() -> None:
     assert trade.side == OrderSide.BUY.value
     assert trade.quantity == Decimal(2)
     assert trade.target_sell_price == Decimal(110)
-    assert trade.broker_order_id == "broker-123"
+    assert trade.broker_order_id is None
     assert trade.filled_avg_price == Decimal(50)
     assert len(book) == 1
     positions = book.pending_and_exiting()  # none pending; all OPEN
@@ -195,8 +195,13 @@ def test_broker_error_sets_failed_and_opens_no_position() -> None:
     def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"message": "bad"})
 
-    service, _writer, book = _service(ExecutionMode.PAPER, transport=httpx.MockTransport(handle))
-    trade = service.execute(Tick(symbol="AAPL", price=Decimal(50)), _entry(), provenance=_PROVENANCE)
+    cash = FakeCash(Decimal(1000))
+    service, _writer, book = _service(
+        ExecutionMode.LIVE, cash=cash, transport=httpx.MockTransport(handle)
+    )
+    trade = service.execute(
+        Tick(symbol="AAPL", price=Decimal(50)), _entry(), provenance=_LIVE_PROVENANCE
+    )
 
     assert trade is not None
     assert trade.status == TradeStatus.FAILED.value
@@ -272,7 +277,7 @@ def test_paper_target_price_exit_closes_position() -> None:
     assert entry_trade.status == TradeStatus.CLOSED.value
     assert entry_trade.exit_reason == ExitReason.TARGET_PRICE.value
     assert entry_trade.exit_filled_avg_price == Decimal(56)
-    assert entry_trade.exit_broker_order_id == "broker-123"
+    assert entry_trade.exit_broker_order_id is None
     assert len(book) == 0
 
 

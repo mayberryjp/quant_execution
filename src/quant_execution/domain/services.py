@@ -14,7 +14,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime
 from datetime import time as clock_time
 from decimal import Decimal
@@ -159,6 +159,11 @@ class ExecutionService:
         with self._seen_lock:
             self._seen.update(keys)
 
+    def forget(self, key: str) -> None:
+        """Drop an idempotency key once its position is closed so the signal can be re-entered."""
+        with self._seen_lock:
+            self._seen.discard(key)
+
     def record_price(self, symbol: str, price: Decimal) -> None:
         """Track the latest price per symbol for market-close paper fills."""
         self._last_price[symbol] = price
@@ -194,7 +199,7 @@ class ExecutionService:
             quantity=qty,
             notional=notional,
             status=TradeStatus.NEW.value,
-            broker=self._broker.name,
+            broker=ExecutionMode.PAPER.value if self._mode.is_paper else self._broker.name,
             idempotency_key=key,
             source_query_id=entry.source_query_id,
             trigger_reason=entry.trigger_reason,
@@ -210,6 +215,32 @@ class ExecutionService:
             if not ok:
                 self._log_entry(entry.symbol, key, TradeStatus.INSUFFICIENT_FUNDS.value, None, start)
                 return trade
+
+        if self._mode.is_paper:
+            # Paper entries fill immediately in-process; no external broker is involved.
+            now = datetime.now(UTC)
+            position = Position(
+                trade_id=trade_id,
+                symbol=entry.symbol,
+                position_type=entry.position_type,
+                quantity=qty,
+                entry_price=tick.price,
+                sell_price=entry.sell_price,
+                is_paper=True,
+                idempotency_key=key,
+                cash_hold_id=hold_id,
+                state=PositionState.OPEN,
+            )
+            self._writer.update(
+                trade_id,
+                status=TradeStatus.FILLED.value,
+                filled_quantity=qty,
+                filled_avg_price=tick.price,
+                filled_at=now,
+            )
+            self._book.open(position)
+            self._log_entry(entry.symbol, key, TradeStatus.FILLED.value, None, start)
+            return trade
 
         try:
             order = self._broker.submit_order(
@@ -244,26 +275,14 @@ class ExecutionService:
             quantity=qty,
             entry_price=tick.price,
             sell_price=entry.sell_price,
-            is_paper=self._mode.is_paper,
+            is_paper=False,
             idempotency_key=key,
             broker_order_id=order.id,
             cash_hold_id=hold_id,
             state=PositionState.PENDING_ENTRY,
         )
-        status = TradeStatus.SUBMITTED.value
-        if self._mode.is_paper:
-            # Paper entries fill immediately; live fills are confirmed by the reconciler (§5.6).
-            position.state = PositionState.OPEN
-            self._writer.update(
-                trade_id,
-                status=TradeStatus.FILLED.value,
-                filled_quantity=qty,
-                filled_avg_price=tick.price,
-                filled_at=now,
-            )
-            status = TradeStatus.FILLED.value
         self._book.open(position)
-        self._log_entry(entry.symbol, key, status, order.id, start)
+        self._log_entry(entry.symbol, key, TradeStatus.SUBMITTED.value, order.id, start)
         return trade
 
     def _reserve_cash(
@@ -318,6 +337,32 @@ class ExecutionService:
         return len(positions)
 
     def _submit_exit(self, position: Position, price: Decimal, reason: ExitReason) -> None:
+        now = datetime.now(UTC)
+        if position.is_paper:
+            # Paper exits fill immediately in-process; no external broker is involved.
+            self._writer.update(
+                position.trade_id,
+                status=TradeStatus.CLOSED.value,
+                exit_reason=reason.value,
+                exit_submitted_at=now,
+                exit_filled_quantity=position.quantity,
+                exit_filled_avg_price=price,
+                closed_at=now,
+            )
+            self._book.remove(position)
+            self.forget(position.idempotency_key)
+            logger.info(
+                format_event(
+                    "exit_submitted",
+                    symbol=position.symbol,
+                    mode=self._mode.value,
+                    idempotency_key=position.idempotency_key,
+                    broker_order_id=None,
+                    reason=reason.value,
+                )
+            )
+            return
+
         exit_key = f"{position.idempotency_key}:exit"
         try:
             order = self._broker.submit_order(
@@ -337,7 +382,6 @@ class ExecutionService:
             logger.warning("exit submit failed symbol=%s: %s", position.symbol, exc)
             return
 
-        now = datetime.now(UTC)
         position.exit_broker_order_id = order.id
         self._writer.update(
             position.trade_id,
@@ -346,15 +390,6 @@ class ExecutionService:
             exit_reason=reason.value,
             exit_submitted_at=now,
         )
-        if position.is_paper:
-            self._writer.update(
-                position.trade_id,
-                status=TradeStatus.CLOSED.value,
-                exit_filled_quantity=position.quantity,
-                exit_filled_avg_price=price,
-                closed_at=now,
-            )
-            self._book.remove(position)
         logger.info(
             format_event(
                 "exit_submitted",
@@ -392,11 +427,13 @@ class PositionReconciler:
         cash: CashClient,
         writer: TradeWriter,
         book: PositionBook,
+        on_close: Callable[[str], None] | None = None,
     ) -> None:
         self._broker = broker
         self._cash = cash
         self._writer = writer
         self._book = book
+        self._on_close = on_close
 
     def reconcile_once(self) -> int:
         """Poll every pending/exiting position once; return how many were checked."""
@@ -465,6 +502,8 @@ class PositionReconciler:
                 closed_at=datetime.now(UTC),
             )
             self._book.remove(position)
+            if self._on_close is not None:
+                self._on_close(position.idempotency_key)
         elif status in _ALPACA_PARTIAL:
             self._writer.update(
                 position.trade_id,
