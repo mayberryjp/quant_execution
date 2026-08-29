@@ -1,8 +1,8 @@
 """HTTP client for the watchlist service ``quant_stickynote`` (SPEC.md §4.1).
 
-Fetches active sticky notes via ``GET /sticky-notes`` with offset/limit paging and returns them
-as :class:`WatchlistEntry` objects. All network access is isolated here so the matching engine
-can be unit-tested without I/O.
+Fetches active sticky notes via ``GET /sticky-notes/latest`` with offset/limit paging and returns
+them as :class:`WatchlistEntry` objects. All network access is isolated here so the matching
+engine can be unit-tested without I/O.
 """
 
 from __future__ import annotations
@@ -49,9 +49,8 @@ class WatchlistClient:
         return entries
 
     def _fetch_page(self, client: httpx.Client, offset: int) -> list[WatchlistEntry]:
-        url = f"{self._base_url}/sticky-notes"
+        url = f"{self._base_url}/sticky-notes/latest"
         params: dict[str, str | int] = {
-            "status": "active",
             "limit": self._page_size,
             "offset": offset,
         }
