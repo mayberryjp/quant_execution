@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     # Database pool.
     db_pool_size: int = 5
     db_max_overflow: int = 10
+    # Dedicated Postgres schema for this service in the shared database.
+    db_schema: str = "execution"
 
     # Logging.
     log_level: str = "INFO"

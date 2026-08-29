@@ -17,11 +17,14 @@ from sqlalchemy import engine_from_config, pool, text
 # Import model modules so their tables are registered on Base.metadata.
 import quant_execution.repository.models  # noqa: F401  (side-effect: register tables)
 from alembic import context
+from quant_execution.config import settings
 from quant_execution.db import Base
 
 # Unique per service so multiple projects can safely share one database.
 VERSION_TABLE = "alembic_version_quant_execution"
-VERSION_TABLE_SCHEMA = None
+# This service owns a dedicated schema in the shared database; its version table and all
+# of its tables live there so nothing collides with other projects in ``public``.
+VERSION_TABLE_SCHEMA = settings.db_schema
 
 # Deterministic advisory-lock key for this service's migrations.
 MIGRATION_LOCK_KEY = 528374091
@@ -33,7 +36,7 @@ def include_object(
     obj: object, name: str | None, type_: str, reflected: bool, compare_to: object
 ) -> bool:
     if type_ == "table":
-        return name in target_metadata.tables
+        return getattr(obj, "schema", None) == VERSION_TABLE_SCHEMA
     return True
 
 
@@ -44,6 +47,7 @@ def run_migrations_offline() -> None:
         version_table=VERSION_TABLE,
         version_table_schema=VERSION_TABLE_SCHEMA,
         include_object=include_object,
+        include_schemas=True,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
@@ -68,8 +72,17 @@ def run_migrations_online() -> None:
                 version_table=VERSION_TABLE,
                 version_table_schema=VERSION_TABLE_SCHEMA,
                 include_object=include_object,
+                include_schemas=True,
             )
             with context.begin_transaction():
+                # Create this service's schema before Alembic creates its version table
+                # inside it, and route the unqualified migration DDL there.
+                connection.execute(
+                    text(f'CREATE SCHEMA IF NOT EXISTS "{VERSION_TABLE_SCHEMA}"')
+                )
+                connection.execute(
+                    text(f'SET search_path TO "{VERSION_TABLE_SCHEMA}", public')
+                )
                 context.run_migrations()
         finally:
             connection.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": MIGRATION_LOCK_KEY})

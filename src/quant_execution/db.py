@@ -10,7 +10,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import MetaData, create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -20,6 +20,9 @@ from quant_execution.config import settings
 
 class Base(DeclarativeBase):
     """Declarative base for all ORM models owned by this service."""
+
+    # All tables live in this service's dedicated schema in the shared database.
+    metadata = MetaData(schema=settings.db_schema)
 
 
 _engine: Engine | None = None
@@ -34,6 +37,7 @@ def get_engine() -> Engine:
             pool_pre_ping=True,
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,
+            connect_args={"options": f"-c search_path={settings.db_schema},public"},
         )
     return _engine
 
@@ -74,7 +78,7 @@ def wait_for_table(table: str, *, timeout: float = 60.0, interval: float = 1.0) 
     deadline = time.monotonic() + timeout
     while True:
         try:
-            if inspect(engine).has_table(table):
+            if inspect(engine).has_table(table, schema=settings.db_schema):
                 return True
         except SQLAlchemyError:
             pass

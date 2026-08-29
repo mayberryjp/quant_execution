@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from quant_execution.config import settings
 from quant_execution.db import get_engine, session_scope
 from quant_execution.repository.models import Trade
 from quant_execution.repository.trades_repo import TradesRepository
@@ -51,8 +52,10 @@ def _make_trade(idempotency_key: str) -> Trade:
 
 def test_trades_table_exists_with_indexes() -> None:
     inspector = inspect(get_engine())
-    assert "trades" in inspector.get_table_names()
-    index_names = {ix["name"] for ix in inspector.get_indexes("trades")}
+    assert "trades" in inspector.get_table_names(schema=settings.db_schema)
+    index_names = {
+        ix["name"] for ix in inspector.get_indexes("trades", schema=settings.db_schema)
+    }
     assert {
         "idx_trades_symbol",
         "idx_trades_status",
