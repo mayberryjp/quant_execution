@@ -237,12 +237,13 @@ FILLED ─► EXIT_SUBMITTED ─► CLOSED
 - `GET /sticky-notes?status=active&limit=...&offset=...` → list of
   `{ symbol, buy_price, position_type, source_query_id, trigger_reason, status }`.
 - Loaded fully into an in-memory `WatchlistStore` once at startup, then reloaded once per
-  session **15 minutes before** market open (per mode, `EXEC_MARKET_OPEN_PAPER` /
-  `EXEC_MARKET_OPEN_LIVE` in `EXEC_MARKET_TIMEZONE`). The startup load keeps a restart from
-  running with an empty watchlist; the scheduled reload picks up the latest sticky notes right
-  before trading begins. `EXEC_WATCHLIST_REFRESH_SECONDS` is only the clock-check cadence of
-  that scheduler, not an unconditional refresh interval; an empty open time disables the
-  scheduled reload (startup load only). Refresh is atomic (build new snapshot, swap reference).
+  session `EXEC_MARKET_OPEN_LEAD_MINUTES_{PAPER,LIVE}` (default 15) **before** market open (per
+  mode, `EXEC_MARKET_OPEN_PAPER` / `EXEC_MARKET_OPEN_LIVE` in `EXEC_MARKET_TIMEZONE`). The startup
+  load keeps a restart from running with an empty watchlist; the scheduled reload picks up the
+  latest sticky notes right before trading begins. `EXEC_WATCHLIST_REFRESH_SECONDS` is only the
+  clock-check cadence of that scheduler, not an unconditional refresh interval; an empty open time
+  disables the scheduled reload (startup load only). Refresh is atomic (build new snapshot, swap
+  reference).
 - A symbol may have multiple entries (different `trigger_reason`); all are armed independently.
 
 ### 4.2 Cash — `quant_cash` (live only)
@@ -352,9 +353,10 @@ position closes.
 - **Target-price exit**: when a streaming price reaches a held position's `sell_price` (LONG:
   `price >= sell_price`; SHORT: `price <= sell_price`), an exit order is submitted for the position's
   `exit_side` (opposite of entry), monitored, and persisted (`EXIT_SUBMITTED` → `CLOSED`).
-- **Market-close liquidation**: **15 minutes before** the configured close time (**separate for
-  paper and live**), a per-mode liquidator submits immediate market exits for **all** open
-  positions once per day. Empty close time disables liquidation for that mode.
+- **Market-close liquidation**: `EXEC_MARKET_CLOSE_LEAD_MINUTES_{PAPER,LIVE}` (default 15)
+  **before** the configured close time (**separate for paper and live**), a per-mode liquidator
+  submits immediate market exits for **all** open positions once per day. Empty close time
+  disables liquidation for that mode.
 - **Restart safety**: on startup, open trades (`CASH_HELD`/`SUBMITTED`/`PARTIALLY_FILLED`/`FILLED`/
   `EXIT_SUBMITTED`/`EXIT_PARTIALLY_FILLED`) are rehydrated into the `PositionBook` and their
   idempotency keys seeded so restarts never re-buy.
@@ -403,10 +405,14 @@ Per Backend Coding Standards §9 (shared database):
 | `EXEC_PRICE_MATCH_TOLERANCE` | `0` | match band (abs or bps) |
 | `EXEC_ALPACA_POLL_SECONDS` | `5` | live reconciliation poll interval |
 | `EXEC_MARKET_TIMEZONE` | `America/New_York` | tz for market-open/close evaluation |
-| `EXEC_MARKET_OPEN_PAPER` | — | paper open time `HH:MM`; watchlist reloads 15m before (empty disables scheduled reload) |
-| `EXEC_MARKET_OPEN_LIVE` | — | live open time `HH:MM`; watchlist reloads 15m before (empty disables scheduled reload) |
-| `EXEC_MARKET_CLOSE_PAPER` | — (required) | paper close time `HH:MM`; positions liquidate 15m before (empty disables liquidation) |
-| `EXEC_MARKET_CLOSE_LIVE` | — (required) | live close time `HH:MM`; positions liquidate 15m before (empty disables liquidation) |
+| `EXEC_MARKET_OPEN_PAPER` | — | paper open time `HH:MM`; watchlist reloads `LEAD_MINUTES` before (empty disables scheduled reload) |
+| `EXEC_MARKET_OPEN_LIVE` | — | live open time `HH:MM`; watchlist reloads `LEAD_MINUTES` before (empty disables scheduled reload) |
+| `EXEC_MARKET_OPEN_LEAD_MINUTES_PAPER` | `15` | minutes before paper open to reload the watchlist |
+| `EXEC_MARKET_OPEN_LEAD_MINUTES_LIVE` | `15` | minutes before live open to reload the watchlist |
+| `EXEC_MARKET_CLOSE_PAPER` | — (required) | paper close time `HH:MM`; positions liquidate `LEAD_MINUTES` before (empty disables liquidation) |
+| `EXEC_MARKET_CLOSE_LIVE` | — (required) | live close time `HH:MM`; positions liquidate `LEAD_MINUTES` before (empty disables liquidation) |
+| `EXEC_MARKET_CLOSE_LEAD_MINUTES_PAPER` | `15` | minutes before paper close to liquidate open positions |
+| `EXEC_MARKET_CLOSE_LEAD_MINUTES_LIVE` | `15` | minutes before live close to liquidate open positions |
 | `EXEC_MARKET_CLOSE_CHECK_SECONDS` | `30` | liquidator poll interval |
 | `EXEC_DB_WRITER_BATCH_SIZE` | `200` | max writes flushed per transaction |
 | `EXEC_DB_WRITER_QUEUE_SIZE` | `100000` | async writer queue capacity (full → drop + log) |

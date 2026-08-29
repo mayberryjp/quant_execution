@@ -70,12 +70,17 @@ class Settings(BaseSettings):
     # mode) triggers the once-per-session watchlist reload; an empty open time disables the
     # scheduled reload (startup load only). The close time (per mode) auto-liquidates all open
     # positions; empty disables auto-liquidation for that mode. Both executors run concurrently,
-    # so each mode has its own open/close.
+    # so each mode has its own open/close. The lead-minutes fire each action that many minutes
+    # before its market time (e.g. reload 15m before open, liquidate 15m before close).
     market_timezone: str = "America/New_York"
     market_open_paper: str = ""
     market_open_live: str = ""
+    market_open_lead_minutes_paper: int = 15
+    market_open_lead_minutes_live: int = 15
     market_close_paper: str = ""
     market_close_live: str = ""
+    market_close_lead_minutes_paper: int = 15
+    market_close_lead_minutes_live: int = 15
     market_close_check_seconds: int = 30
 
     # Non-blocking DB writer (in-memory position book is the hot-path source of truth).

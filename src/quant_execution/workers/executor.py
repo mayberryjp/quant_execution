@@ -43,10 +43,6 @@ from quant_execution.repository.trades_repo import TradesRepository
 
 VALID_MODES = tuple(m.value for m in ExecutionMode)
 
-# Both the pre-session watchlist reload and the market-close liquidation fire this many minutes
-# before their configured market open/close time.
-SESSION_LEAD_MINUTES = 15
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="quant_execution.workers.executor")
@@ -105,7 +101,12 @@ def main() -> None:
     store = WatchlistStore(tolerance=Decimal(str(settings.price_match_tolerance)))
     watchlist_client = WatchlistClient(settings.watchlist_api_url)
     open_raw = settings.market_open_paper if mode.is_paper else settings.market_open_live
-    open_time = shift_earlier(parse_close_time(open_raw), SESSION_LEAD_MINUTES)
+    open_lead = (
+        settings.market_open_lead_minutes_paper
+        if mode.is_paper
+        else settings.market_open_lead_minutes_live
+    )
+    open_time = shift_earlier(parse_close_time(open_raw), open_lead)
     refresher = WatchlistRefresher(
         store,
         watchlist_client.fetch_active,
@@ -146,7 +147,7 @@ def main() -> None:
     log.info(
         "watchlist refresher armed trigger=%s (%dm before open=%s) tz=%s",
         open_time,
-        SESSION_LEAD_MINUTES,
+        open_lead,
         open_raw,
         settings.market_timezone,
     )
@@ -161,7 +162,12 @@ def main() -> None:
         log.info("reconciliation loop started interval=%ss", settings.alpaca_poll_seconds)
 
     close_raw = settings.market_close_paper if mode.is_paper else settings.market_close_live
-    close_time = shift_earlier(parse_close_time(close_raw), SESSION_LEAD_MINUTES)
+    close_lead = (
+        settings.market_close_lead_minutes_paper
+        if mode.is_paper
+        else settings.market_close_lead_minutes_live
+    )
+    close_time = shift_earlier(parse_close_time(close_raw), close_lead)
     liquidator = MarketCloseLiquidator(
         service,
         close_time,
@@ -172,7 +178,7 @@ def main() -> None:
     log.info(
         "market close liquidator armed trigger=%s (%dm before close=%s) tz=%s",
         close_time,
-        SESSION_LEAD_MINUTES,
+        close_lead,
         close_raw,
         settings.market_timezone,
     )
