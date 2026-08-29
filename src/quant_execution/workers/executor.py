@@ -37,11 +37,16 @@ from quant_execution.domain.services import (
     shift_earlier,
 )
 from quant_execution.kafka.consumer import MessageMeta, TickConsumer, create_consumer
-from quant_execution.logging import configure_logging, get_logger
+from quant_execution.logging import configure_logging, format_event, get_logger
 from quant_execution.repository.async_writer import AsyncDbWriter
 from quant_execution.repository.trades_repo import TradesRepository
 
 VALID_MODES = tuple(m.value for m in ExecutionMode)
+
+# Sampled tick heartbeat: log the first tick seen, then one in every _TICK_LOG_SAMPLE.
+_TICK_LOG_SAMPLE = 1000
+_stream_log = get_logger("executor.stream")
+_tick_seen = 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -60,6 +65,12 @@ def process_message(
     if value is None:
         raise ValueError("empty message value")
     tick = Tick.parse(value)
+    global _tick_seen
+    _tick_seen += 1
+    if _tick_seen == 1 or _tick_seen % _TICK_LOG_SAMPLE == 0:
+        _stream_log.info(
+            format_event("tick_stream", symbol=tick.symbol, price=tick.price, seen=_tick_seen)
+        )
     service.record_price(tick.symbol, tick.price)
     for entry in store.match(tick.symbol, tick.price):
         service.execute(tick, entry, provenance=meta)
