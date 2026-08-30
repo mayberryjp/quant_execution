@@ -65,6 +65,15 @@ def test_trades_table_exists_with_indexes() -> None:
     } <= index_names
 
 
+def test_daily_pnl_table_exists() -> None:
+    inspector = inspect(get_engine())
+    assert "daily_pnl" in inspector.get_table_names(schema=settings.db_schema)
+    index_names = {
+        ix["name"] for ix in inspector.get_indexes("daily_pnl", schema=settings.db_schema)
+    }
+    assert {"idx_daily_pnl_trade_date", "idx_daily_pnl_is_paper"} <= index_names
+
+
 def test_repository_round_trip() -> None:
     key = f"paper:AAPL:test:{uuid.uuid4()}"
     with session_scope() as session:

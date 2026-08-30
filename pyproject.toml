@@ -44,6 +44,7 @@ source = ["quant_execution"]
 omit = [
   "src/quant_execution/__main__.py",
   "src/quant_execution/workers/executor.py",
+  "src/quant_execution/workers/pnl_reporter.py",
 ]
 
 [tool.coverage.report]

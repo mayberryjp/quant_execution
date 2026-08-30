@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     market_close_lead_minutes_live: int = 15
     market_close_check_seconds: int = 30
 
+    # Daily P&L reporter wake-up cadence (seconds). The reporter fires once per day per mode at or
+    # after that mode's close time; this is only the clock-check interval, not a report frequency.
+    pnl_report_check_seconds: int = 900
+
     # Non-blocking DB writer (in-memory position book is the hot-path source of truth).
     db_writer_batch_size: int = 200
     db_writer_queue_size: int = 100_000

@@ -7,6 +7,7 @@ from typing import Any
 from bottle import Bottle, response
 
 from quant_execution.api.routes.health import register_health_routes
+from quant_execution.api.routes.pnl import register_pnl_routes
 from quant_execution.api.routes.trades import register_trade_routes
 
 SERVICE_NAME = "quant-execution-api"
@@ -18,6 +19,7 @@ def create_app() -> Bottle:
 
     register_health_routes(app)
     register_trade_routes(app)
+    register_pnl_routes(app)
 
     @app.hook("after_request")
     def _add_cors_headers() -> None:

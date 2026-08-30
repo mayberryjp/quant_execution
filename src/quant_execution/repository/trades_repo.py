@@ -13,6 +13,7 @@ from datetime import datetime
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from quant_execution.domain.enums import TradeStatus
 from quant_execution.repository.models import Trade
 
 __all__ = ["TradesRepository"]
@@ -98,6 +99,23 @@ class TradesRepository:
             select(Trade)
             .where(Trade.status.in_(statuses), Trade.is_paper == is_paper)
             .order_by(Trade.created_at)
+            .limit(limit)
+        )
+        return list(self._session.execute(stmt).scalars().all())
+
+    def list_closed_between(
+        self, start: datetime, end: datetime, *, is_paper: bool, limit: int = 100_000
+    ) -> list[Trade]:
+        """Load CLOSED trades whose exit landed in ``(start, end]`` for one mode (daily P&L)."""
+        stmt = (
+            select(Trade)
+            .where(
+                Trade.is_paper == is_paper,
+                Trade.status == TradeStatus.CLOSED.value,
+                Trade.closed_at > start,
+                Trade.closed_at <= end,
+            )
+            .order_by(Trade.closed_at)
             .limit(limit)
         )
         return list(self._session.execute(stmt).scalars().all())

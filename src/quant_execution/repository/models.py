@@ -6,19 +6,21 @@ The service owns only the ``trades`` table (SPEC.md §3.1 / §3.2).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
     CHAR,
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Index,
     Integer,
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -26,7 +28,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from quant_execution.db import Base
 
-__all__ = ["Base", "Trade"]
+__all__ = ["Base", "DailyPnl", "Trade"]
 
 _NUM = Numeric(20, 8)
 
@@ -110,4 +112,54 @@ class Trade(Base):
         Index("idx_trades_is_paper", "is_paper"),
         Index("idx_trades_created_at", "created_at"),
         Index("uq_trades_idempotency_key", "idempotency_key", unique=True),
+    )
+
+
+class DailyPnl(Base):
+    """End-of-day profit-and-loss summary for one trading day and mode (paper/live).
+
+    One row per ``(trade_date, is_paper)`` is written by the daily P&L reporter after each mode's
+    market close, aggregating every trade that closed during that session.
+    """
+
+    __tablename__ = "daily_pnl"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    execution_mode: Mapped[str] = mapped_column(String(8), nullable=False)
+    is_paper: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    total_trades: Mapped[int] = mapped_column(Integer, nullable=False)
+    winning_trades: Mapped[int] = mapped_column(Integer, nullable=False)
+    losing_trades: Mapped[int] = mapped_column(Integer, nullable=False)
+    breakeven_trades: Mapped[int] = mapped_column(Integer, nullable=False)
+    symbols_traded: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    realized_pnl: Mapped[Decimal] = mapped_column(_NUM, nullable=False)
+    amount_invested: Mapped[Decimal] = mapped_column(_NUM, nullable=False)
+    gross_proceeds: Mapped[Decimal] = mapped_column(_NUM, nullable=False)
+    win_rate: Mapped[Decimal] = mapped_column(_NUM, nullable=False)
+    return_pct: Mapped[Decimal] = mapped_column(_NUM, nullable=False)
+    average_win: Mapped[Decimal] = mapped_column(_NUM, nullable=False)
+    average_loss: Mapped[Decimal] = mapped_column(_NUM, nullable=False)
+    largest_win: Mapped[Decimal] = mapped_column(_NUM, nullable=False)
+    largest_loss: Mapped[Decimal] = mapped_column(_NUM, nullable=False)
+    currency: Mapped[str] = mapped_column(CHAR(3), nullable=False, default="USD")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("trade_date", "is_paper", name="uq_daily_pnl_date_mode"),
+        Index("idx_daily_pnl_trade_date", "trade_date"),
+        Index("idx_daily_pnl_is_paper", "is_paper"),
     )
