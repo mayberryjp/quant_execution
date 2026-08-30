@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime
 from datetime import time as clock_time
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from zoneinfo import ZoneInfo
 
 from quant_execution.clients.alpaca_client import AlpacaBroker, AlpacaOrder
@@ -66,7 +66,11 @@ def compute_sizing(
     notional_usd: float | None,
     quantity: float | None,
 ) -> tuple[Decimal, Decimal]:
-    """Return ``(quantity, notional)`` from config; exactly one rule must be set (§5.3)."""
+    """Return ``(quantity, notional)`` from config; exactly one rule must be set (§5.3).
+
+    Orders are whole shares only: the quantity is rounded down to the nearest integer, and the
+    notional is recomputed from that whole quantity (so a notional budget may be under-filled).
+    """
     if (notional_usd is None) == (quantity is None):
         raise ConfigurationError(
             "exactly one of EXEC_ORDER_NOTIONAL_USD or EXEC_ORDER_QUANTITY must be set"
@@ -74,9 +78,10 @@ def compute_sizing(
     if trigger_price <= 0:
         raise ConfigurationError("trigger price must be positive for sizing")
     if notional_usd is not None:
-        notional = Decimal(str(notional_usd))
-        return notional / trigger_price, notional
-    qty = Decimal(str(quantity))
+        raw_qty = Decimal(str(notional_usd)) / trigger_price
+    else:
+        raw_qty = Decimal(str(quantity))
+    qty = raw_qty.to_integral_value(rounding=ROUND_DOWN)
     return qty, qty * trigger_price
 
 

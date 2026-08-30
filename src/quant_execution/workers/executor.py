@@ -14,6 +14,7 @@ import argparse
 import logging
 import signal
 import threading
+from datetime import datetime
 from decimal import Decimal
 from types import FrameType
 from zoneinfo import ZoneInfo
@@ -48,6 +49,14 @@ _TICK_LOG_SAMPLE = 1000
 _stream_log = get_logger("executor.stream")
 _tick_seen = 0
 
+_MARKET_TZ = ZoneInfo(settings.market_timezone)
+
+
+def is_trading_day(now: datetime | None = None) -> bool:
+    """True on Mon-Fri in the market timezone; weekend ticks are dropped (no weekend runs)."""
+    moment = now or datetime.now(_MARKET_TZ)
+    return moment.weekday() < 5
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="quant_execution.workers.executor")
@@ -62,6 +71,8 @@ def process_message(
     service: ExecutionService,
 ) -> None:
     """Per-tick hot path: record price, open on match, exit on target. Raises on poison input."""
+    if not is_trading_day():
+        return
     if value is None:
         raise ValueError("empty message value")
     tick = Tick.parse(value)

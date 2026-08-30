@@ -140,6 +140,18 @@ def test_compute_sizing_by_notional() -> None:
     assert notional == Decimal(100)
 
 
+def test_compute_sizing_rounds_down_to_whole_shares() -> None:
+    # $100 budget at $30 buys 3 whole shares (3.33 floored); notional reflects the 3 shares.
+    qty, notional = compute_sizing(Decimal(30), notional_usd=100.0, quantity=None)
+    assert qty == Decimal(3)
+    assert notional == Decimal(90)
+
+    # A fractional configured quantity is floored too.
+    qty, notional = compute_sizing(Decimal(20), notional_usd=None, quantity=3.7)
+    assert qty == Decimal(3)
+    assert notional == Decimal(60)
+
+
 def test_compute_sizing_requires_exactly_one() -> None:
     with pytest.raises(ConfigurationError):
         compute_sizing(Decimal(50), notional_usd=None, quantity=None)
