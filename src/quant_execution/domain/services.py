@@ -183,7 +183,6 @@ class ExecutionService:
         key = build_idempotency_key(self._mode, entry, tick)
         with self._seen_lock:
             if key in self._seen:
-                logger.info(format_event("trade_dedup", symbol=entry.symbol, idempotency_key=key))
                 return None
             self._seen.add(key)
 
