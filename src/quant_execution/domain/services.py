@@ -60,6 +60,23 @@ def build_idempotency_key(mode: ExecutionMode, entry: WatchlistEntry, tick: Tick
     return f"{mode.value}:{entry.symbol}:{entry.trigger_reason or ''}:{signal_date}"
 
 
+def compose_key(base: str, attempt: int) -> str:
+    """Full idempotency key for a re-entry ``attempt``; attempt 0 is the bare date-scoped base.
+
+    Re-entries append ``:r{attempt}`` so a signal that closes and re-triggers the same day gets a
+    distinct key instead of colliding with the row already persisted under the base key.
+    """
+    return base if attempt == 0 else f"{base}:r{attempt}"
+
+
+def split_attempt(key: str) -> tuple[str, int]:
+    """Inverse of :func:`compose_key`: split a full key into ``(base, attempt)``."""
+    base, sep, suffix = key.rpartition(":r")
+    if sep and suffix.isdigit():
+        return base, int(suffix)
+    return key, 0
+
+
 def compute_sizing(
     trigger_price: Decimal,
     *,
@@ -152,6 +169,7 @@ class ExecutionService:
         self._quantity = quantity
         self._cash = cash
         self._seen: set[str] = set()
+        self._attempts: dict[str, int] = {}
         self._seen_lock = threading.Lock()
         self._last_price: dict[str, Decimal] = {}
 
@@ -160,14 +178,24 @@ class ExecutionService:
         return self._book
 
     def seed(self, keys: Iterable[str]) -> None:
-        """Pre-load idempotency keys of already-open trades so restarts do not re-buy."""
+        """Pre-load idempotency keys of already-open trades so restarts do not re-buy.
+
+        Each key's re-entry attempt is restored too, so a position that closes after a restart
+        bumps to the correct next attempt instead of reusing a key already persisted.
+        """
         with self._seen_lock:
-            self._seen.update(keys)
+            for key in keys:
+                self._seen.add(key)
+                base, attempt = split_attempt(key)
+                self._attempts[base] = attempt
 
     def forget(self, key: str) -> None:
-        """Drop an idempotency key once its position is closed so the signal can be re-entered."""
+        """Drop a closed trade's key and bump its signal's re-entry counter so a same-day
+        re-trigger opens a fresh trade under a new key instead of colliding with this one."""
         with self._seen_lock:
             self._seen.discard(key)
+            base, attempt = split_attempt(key)
+            self._attempts[base] = attempt + 1
 
     def record_price(self, symbol: str, price: Decimal) -> None:
         """Track the latest price per symbol for market-close paper fills."""
@@ -180,8 +208,9 @@ class ExecutionService:
     ) -> Trade | None:
         """Open a position for one matched signal; returns the entry trade, or ``None`` on dedup."""
         start = time.perf_counter()
-        key = build_idempotency_key(self._mode, entry, tick)
+        base = build_idempotency_key(self._mode, entry, tick)
         with self._seen_lock:
+            key = compose_key(base, self._attempts.get(base, 0))
             if key in self._seen:
                 return None
             self._seen.add(key)

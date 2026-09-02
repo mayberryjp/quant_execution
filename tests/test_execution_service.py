@@ -203,6 +203,36 @@ def test_execute_dedup_is_noop() -> None:
     assert len(book) == 1
 
 
+def test_reentry_after_close_uses_new_key() -> None:
+    service, _writer, book = _service(ExecutionMode.PAPER)
+    tick = Tick(symbol="AAPL", price=Decimal(50), ts=datetime(2026, 8, 31, 12, 0, tzinfo=UTC))
+    first = service.execute(tick, _entry(sell=Decimal(55)), provenance=_PROVENANCE)
+    assert first is not None
+    # The flood of matching ticks before the position closes is still a single entry.
+    assert service.execute(tick, _entry(sell=Decimal(55)), provenance=_PROVENANCE) is None
+
+    service.check_exits(Tick(symbol="AAPL", price=Decimal(56)))  # closes and forgets the key
+    assert len(book) == 0
+
+    second = service.execute(tick, _entry(sell=Decimal(55)), provenance=_PROVENANCE)
+    assert second is not None
+    assert second.idempotency_key == f"{first.idempotency_key}:r1"
+    assert len(book) == 1
+
+
+def test_seed_restores_reentry_attempt_across_restart() -> None:
+    service, _writer, _book = _service(ExecutionMode.PAPER)
+    service.seed(["paper:AAPL:dip:2026-08-31:r2"])  # an open re-entry rehydrated at startup
+    tick = Tick(symbol="AAPL", price=Decimal(50), ts=datetime(2026, 8, 31, 12, 0, tzinfo=UTC))
+    # While that entry is open its key is deduped, not re-bought.
+    assert service.execute(tick, _entry(), provenance=_PROVENANCE) is None
+
+    service.forget("paper:AAPL:dip:2026-08-31:r2")
+    trade = service.execute(tick, _entry(), provenance=_PROVENANCE)
+    assert trade is not None
+    assert trade.idempotency_key == "paper:AAPL:dip:2026-08-31:r3"
+
+
 def test_broker_error_sets_failed_and_opens_no_position() -> None:
     def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"message": "bad"})
